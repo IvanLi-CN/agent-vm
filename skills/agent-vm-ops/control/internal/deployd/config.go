@@ -54,10 +54,29 @@ type Config struct {
 const DedicatedDatabase = "/var/lib/agent-vm-native/deployment/runtime/deployment.sqlite3"
 const ServerRuntimeHome = "/var/lib/agent-vm-native/server"
 
-func (config *Config) SelectRuntimeDatabase(uid int) {
+func (config *Config) SelectRuntimeDatabase(uid int) error {
 	if isDeployAccount(uid) && config.Database == Defaults().Database {
+		if err := verifyAccountDatabaseSelection(config.Database, DedicatedDatabase); err != nil {
+			return err
+		}
 		config.Database = DedicatedDatabase
 	}
+	return nil
+}
+
+func verifyAccountDatabaseSelection(legacyPath, dedicatedPath string) error {
+	if info, err := os.Lstat(dedicatedPath); err == nil {
+		if !info.Mode().IsRegular() || info.Size() == 0 {
+			return errors.New("dedicated deployment journal is not an installed SQLite file")
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect dedicated deployment journal: %w", err)
+	}
+	if _, err := os.Lstat(legacyPath); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("existing deployment journal requires host account migration before startup")
+	}
+	return nil
 }
 
 func Defaults() Config {

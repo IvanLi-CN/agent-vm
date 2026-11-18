@@ -1,6 +1,30 @@
 package deployd
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestDedicatedAccountDoesNotDiscardLegacyJournal(t *testing.T) {
+	dir := t.TempDir()
+	legacy, dedicated := filepath.Join(dir, "legacy"), filepath.Join(dir, "dedicated")
+	if err := verifyAccountDatabaseSelection(legacy, dedicated); err != nil {
+		t.Fatalf("fresh install: %v", err)
+	}
+	if err := os.WriteFile(legacy, []byte("legacy journal"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyAccountDatabaseSelection(legacy, dedicated); err == nil {
+		t.Fatal("startup permitted a fresh journal over an existing installation")
+	}
+	if err := os.Symlink(legacy, dedicated); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyAccountDatabaseSelection(legacy, dedicated); err == nil {
+		t.Fatal("startup accepted a symlink")
+	}
+}
 
 func TestConfigRequiresTLSAndACLForNonLoopbackMetrics(t *testing.T) {
 	config := Defaults()

@@ -46,7 +46,9 @@ func runServe(args []string) error {
 		return fmt.Errorf("acquire deployd singleton lock: %w", err)
 	}
 	defer processLock.Close()
-	config.SelectRuntimeDatabase(os.Geteuid())
+	if err := config.SelectRuntimeDatabase(os.Geteuid()); err != nil {
+		return err
+	}
 	database, err := store.Open(config.Database, config.Retention(), time.Now)
 	if err != nil {
 		return err
