@@ -33,7 +33,7 @@ import {
 } from "./control-types.ts";
 import { parseSemVer } from "./semver.ts";
 
-import { ACTIONS as RUNTIME_ACTIONS, runtimeActions } from "../../agent-vm/scripts/client-release.ts";
+import { ACTIONS as RUNTIME_ACTIONS, runtimeActions } from "./client-release.ts";
 
 export const MANIFEST_FORMAT = 1;
 export const PROTOCOL_VERSION = 4;

@@ -17,7 +17,7 @@ The initialization baseline is intentionally narrow:
 
 Leaving the project-level aggregate process quota unset prevents stopped cache instances from consuming a second, implicit process budget. The profile-level process limit remains the per-instance protection. This does not increase the control service's logical CPU or memory ceilings.
 
-容器内运行 Incus 时，先按[嵌套权限手册](../../../deploy/docs/nested-incus.md)检查外层有效 UID/GID、内层 subordinate ID 授权、helper 和安全能力，并独立验收声明支持的 guest 模式。此初始化器不会检查或修改 `security.privileged`、`security.nesting`、`security.idmap.*`、`raw.idmap` 或 `/etc/subuid`、`/etc/subgid`；`aligned` 只表示本文列出的配额基线一致，不代表非特权嵌套可用。
+容器内运行 Incus 时，先按 [v1.8.0 嵌套权限手册](https://github.com/IvanLi-CN/agent-vm/blob/v1.8.0/deploy/docs/nested-incus.md) 检查外层有效 UID/GID、内层 subordinate ID 授权、helper 和安全能力，并独立验收声明支持的 guest 模式。此初始化器不会检查或修改 `security.privileged`、`security.nesting`、`security.idmap.*`、`raw.idmap` 或 `/etc/subuid`、`/etc/subgid`；`aligned` 只表示本文列出的配额基线一致，不代表非特权嵌套可用。
 
 ## Preconditions
 
@@ -26,7 +26,7 @@ Use this procedure only for an explicitly authorized infrastructure task.
 1. Read the configured control alias from the protected deployment configuration. Do not copy the alias, address or credentials into this repository.
 2. Run `agent-vm doctor`, `agent-vm admin status`, `agent-vm admin session list` and `ssh -G <configured-control-alias>`.
 3. Inspect the exact Incus project and profile identities, native service health, pending operations and current task leases.
-4. 按[维护 drain 与恢复](../../../deploy/docs/maintenance.md)确认没有活动发布或未知 owner，使用本次唯一的 `release-maintenance-<unique-id>` 会话执行 `agent-vm --session-id <该会话> admin drain enter`。保存同一会话直到退出；普通会话进入成功不保证其有权退出。等待有效租约和 pending transition 收敛后才能应用策略修改。
+4. 按 [v1.8.0 维护 drain 与恢复手册](https://github.com/IvanLi-CN/agent-vm/blob/v1.8.0/deploy/docs/maintenance.md) 确认没有活动发布或未知 owner，使用本次唯一的 `release-maintenance-<unique-id>` 会话执行 `agent-vm --session-id <该会话> admin drain enter`。保存同一会话直到退出；普通会话进入成功不保证其有权退出。等待有效租约和 pending transition 收敛后才能应用策略修改。
 5. Keep a protected maintenance record of the preview output and the operator, time and deployment identity.
 
 Do not combine initialization with broad reconcile, garbage collection, instance deletion, image replacement, network changes, storage changes or state-database edits.
@@ -36,14 +36,14 @@ Do not combine initialization with broad reconcile, garbage collection, instance
 The script uses the Incus JSON API through `incus query` for reads and narrow Incus CLI mutations for writes. It requires an explicit remote alias and defaults to a read-only preview:
 
 ```sh
-bun skills/agent-vm-ops/scripts/agent_vm_incus_init.ts \
+bun "<skill-dir>/scripts/agent_vm_incus_init.ts" \
   --remote <configured-control-alias>
 ```
 
 The preview exits with status `0` when aligned and status `2` when it finds changes. Review its JSON actions. Apply only the reviewed plan while drain is active:
 
 ```sh
-bun skills/agent-vm-ops/scripts/agent_vm_incus_init.ts \
+bun "<skill-dir>/scripts/agent_vm_incus_init.ts" \
   --remote <configured-control-alias> \
   --project <incus-project> \
   --profile <incus-profile> \

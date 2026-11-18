@@ -7,9 +7,9 @@ description: 在明确的基础设施任务中维护已配置的 native Incus Ag
 
 本 Skill 仅用于明确授权的基础设施任务。
 日常命令和 admin command 共用已配置的管理访问；`session_id` 是 ownership metadata，不是 credential boundary。
-CLI 见[命令合同](../../docs/specs/agent-vm/contracts/cli.md)；生命周期和容量策略由 [SPEC](../../docs/specs/agent-vm/SPEC.md) 维护。
+CLI 见 [v1.8.0 命令合同](https://github.com/IvanLi-CN/agent-vm/blob/v1.8.0/docs/specs/agent-vm/contracts/cli.md)；生命周期和容量策略由 [v1.8.0 SPEC](https://github.com/IvanLi-CN/agent-vm/blob/v1.8.0/docs/specs/agent-vm/SPEC.md) 维护。
 
-进行控制面重建或恢复时，遵循[拓扑与恢复运行手册](../../docs/specs/agent-vm/OPERATIONS.md)。
+进行控制面重建或恢复时，遵循 [v1.8.0 拓扑与恢复运行手册](https://github.com/IvanLi-CN/agent-vm/blob/v1.8.0/docs/specs/agent-vm/OPERATIONS.md)。
 该手册区分已配置的 control entry、CT109、managed Incus system container 和任何未经验证的下层宿主机；它不授权宿主机维护，也不授权猜测 rebuild path。
 
 ## 检查与维护
@@ -27,7 +27,7 @@ Drain 拒绝新的 lease 和 restart admission，允许在线 retrieval/release�
 升级后检查 native Incus/systemd/OpenSSH 行为。
 本 Skill 不授权外部宿主机生命周期变更、自动重启控制环境或大范围 cleanup。
 
-只部署来自同一 revision 的正式候选版本：包括[Go 控制服务](control/cmd/agent-vm-server/main.go)、槽位外的 deployd 服务、[format-2 bridge](scripts/agent_vm_control_bridge.ts)、完整客户端包和[systemd 资源](assets/systemd/)。
+只部署来自同一 revision 的正式候选版本：包括 Go 控制服务、槽位外的 deployd 服务、[format-2 bridge](scripts/agent_vm_control_bridge.ts)、完整客户端包和 systemd 资源。实现与资源必须来自同一 release package。
 路径和验证遵循[部署参考](references/deployment.md)，Incus project/profile policy 遵循[初始化参考](references/initialization.md)，native OS 和 guest prerequisite 遵循[运行时合同](references/control-runtime.md)。
 当前 release 只允许 Go native control 与固定的 Go `request` adapter；SSH 入口通过受保护 UDS 转发请求。历史格式仅由离线迁移工具读取。
 修改 client 前先 build、verify 和 publish matching manifest。
@@ -36,10 +36,10 @@ Drain 拒绝新的 lease 和 restart admission，允许在线 retrieval/release�
 只有 deployd 报告新鲜的槽位健康状态、控制器主权、流量排空、startup reconciliation、expiry/GC 和 storage admission 证据后，才能退出 drain。
 
 控制面发布是运维者负责的人工 release operation，入口是目标服务器上的 `agent-vm-deploy update`，不是公共 `agent-vm` 生命周期 command。Agent 只通过已配置的 SSH alias 提交版本和 source revision；release 下载、目标架构选择、provenance/checksum 校验和 blue-green transaction 都在目标服务器上完成。不得从 Agent 工作站下载 release、使用 `scp`/`rsync` 上传 release bundle，或依据 Agent 工作站架构选择 native package。
-遵循[部署参考](references/deployment.md)和[发布合同](../../docs/specs/agent-vm/contracts/release.md)中的 release manifest、兼容性、staging、drain、原子 activation、rollback 和权限规则；兼容 action 可以跨 release revision 继续使用并返回结构化 warning，不兼容 action 必须在产生 native effect 前失败。
+遵循[部署参考](references/deployment.md)和 [v1.8.0 发布合同](https://github.com/IvanLi-CN/agent-vm/blob/v1.8.0/docs/specs/agent-vm/contracts/release.md)中的 release manifest、兼容性、staging、drain、原子 activation、rollback 和权限规则；兼容 action 可以跨 release revision 继续使用并返回结构化 warning，不兼容 action 必须在产生 native effect 前失败。
 自动更新默认保持关闭。
 
-`agent-vm` skill 的 guest/source 传输不负责控制宿主部署。日常更新在控制宿主执行 `agent-vm-deploy update --version <semver> --source-revision <sha>`。维护者明确选择指定文件部署时，按[蓝绿手册](../../deploy/docs/blue-green.md)将正式完整包放到控制宿主的受保护目录并传 `--bundle`；`--server-file` 只能随完整包使用，并须与包内 `agent-vm-server` 字节一致。遇到 `backup_storage_exhausted` 停止本次操作；现役槽继续服务。低层 `stage`、`verify`、`activate` 和 `recover` 仅用于诊断和受限恢复。
+`agent-vm` skill 的 guest/source 传输不负责控制宿主部署。日常更新在控制宿主执行 `agent-vm-deploy update --version <semver> --source-revision <sha>`。维护者明确选择指定文件部署时，按 [v1.8.0 蓝绿手册](https://github.com/IvanLi-CN/agent-vm/blob/v1.8.0/deploy/docs/blue-green.md) 将正式完整包放到控制宿主的受保护目录并传 `--bundle`；`--server-file` 只能随完整包使用，并须与包内 `agent-vm-server` 字节一致。遇到 `backup_storage_exhausted` 停止本次操作；现役槽继续服务。低层 `stage`、`verify`、`activate` 和 `recover` 仅用于诊断和受限恢复。
 
 Client/control 使用 protocol 4，并增加显式的 live memory-only adjustment；不兼容的旧 peer 必须在产生 effect 前失败。
 升级前保留 database、generation 和 journal。
@@ -89,7 +89,11 @@ CPU PSI 是 startup-schedulability 观测，不是逻辑 CPU admission 的替代
 当 projected CPU 超过 CT-visible CPU capacity，且已验证的 `full.avg10` 达到 `cpu_startup_pressure_full_avg10_percent` 时，必须在改变 native state 前以结构化 `resource_pressure` 拒绝新的 acquire/resume/restart startup。
 不得停止 effective lease、降低 logical CPU remaining，或阻止 read、renew、release 或 live memory-only resize；缺失 PSI 必须保持为明确的 observation failure。
 
-Dashboard 集成遵循[观测合同](../../docs/specs/agent-vm/contracts/observability.md)。
+## 观测与初始化工具
+
+Dashboard 集成遵循 [观测合同](https://github.com/IvanLi-CN/agent-vm/blob/v1.8.0/docs/specs/agent-vm/contracts/observability.md)，工具和模板随本 Skill 一起交付。模板位于 `assets/observability/`，用法见 [观测参考](references/observability.md)。
+使用 `bun "<skill-dir>/scripts/render_observability_dashboard.ts" --config <config> --output-dir <directory> --force` 渲染；使用 `bun "<skill-dir>/scripts/validate_observability_dashboard.ts" --dashboard <dashboard> --provisioning <provisioning> [--profile capacity|inventory|deployd]` 校验。两个入口只读取本 Skill 目录内的模板和校验器。
+`bun "<skill-dir>/scripts/agent_vm_incus_init.ts" --host <alias>` 默认只做 read-only preview；需要应用变更时必须在维护 drain 中审查输出后显式加 `--apply`。初始化参考见 `references/initialization.md`。
 CT root 和 image-staging filesystem 必须与 physical pool 和 guest rootfs allocation panel 分开。
 Native admission limit 来自 Go service 导出的 snapshot；未设置的 Incus project quota 不是 admission limit。
 服务 HTTP API 是受保护的控制边界，不是公共 metrics broker；relay 只读取已有 snapshot。

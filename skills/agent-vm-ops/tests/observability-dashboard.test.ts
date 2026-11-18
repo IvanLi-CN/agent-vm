@@ -341,6 +341,24 @@ test("reclaims a stale output-directory lock", () => {
   }
 });
 
+test("does not remove a freshly claimed lock during stale recovery", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-vm-observability-stale-race-"));
+  try {
+    const lockPath = join(root, ".agent-vm-observability.lock");
+    mkdirSync(lockPath);
+    writeFileSync(join(lockPath, "owner.json"), JSON.stringify({ pid: 2147483647, token: "stale", started_at: "2000-01-01T00:00:00Z" }));
+    const reclaimRename: typeof renameSync = (oldPath, newPath) => {
+      renameSync(oldPath, newPath);
+      mkdirSync(lockPath);
+      writeFileSync(join(lockPath, "owner.json"), JSON.stringify({ pid: process.pid, token: "fresh", started_at: new Date().toISOString() }));
+    };
+    expect(() => writeBundle(renderBundle(config), root, true, reclaimRename)).toThrow(`owner pid ${process.pid} is alive`);
+    expect(readFileSync(join(lockPath, "owner.json"), "utf8")).toContain('"token":"fresh"');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("serializes bundle writes with an output-directory lock", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-vm-observability-lock-"));
   try {

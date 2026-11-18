@@ -108,7 +108,7 @@ class AgentVmDocumentationTests(unittest.TestCase):
         self.assertIn("OPERATIONS.md", spec)
         self.assertIn("../OPERATIONS.md", cli_contract)
         self.assertIn("0028-agent-vm-topology-recovery-boundary.md", spec)
-        self.assertIn("../../docs/specs/agent-vm/OPERATIONS.md", ops_skill)
+        self.assertIn("https://github.com/IvanLi-CN/agent-vm/blob/v1.8.0/docs/specs/agent-vm/OPERATIONS.md", ops_skill)
         self.assertIn("../../docs/specs/agent-vm/OPERATIONS.md", deployment)
         self.assertIn("references/initialization.md", ops_skill)
         self.assertIn("initialization reference", deployment)

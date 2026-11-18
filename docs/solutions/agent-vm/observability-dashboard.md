@@ -25,7 +25,7 @@ status: active related_specs:
 
 Incus pool metrics 与 guest filesystem metrics 描述的是不同层次。 Image unpacking 会在最终分配 instance storage 之前使用 CT-local staging path，而 native controller 在另一个控制边界维护 admission reservation 和状态。只使用 Incus project 或 guest metrics 的看板无法解释这两个 failure domain，也无法解释 native limit。
 
-本仓库拥有 native controller、公开合同以及 `deploy/observability/` 下的参数化 Grafana 基线。直接修改 Grafana database copy 仍然只是临时操作，公共模板与 renderer 才是可以由各部署实例化的仓库实现。
+本仓库拥有 native controller、公开合同以及 `skills/agent-vm-ops/assets/observability/` 下的参数化 Grafana 基线。直接修改 Grafana database copy 仍然只是临时操作，公共模板与 renderer 才是可以由各部署实例化的仓库实现。
 
 原看板还没有清晰说明 CPU startup admission：logical CPU reservation、CT-visible CPU capacity 和 CT-local PSI 被看成了同一个 limit。批准的 overcommit policy 保持 logical ceiling 独立，只有 projected CPU 超过 CT-visible capacity 且 `full.avg10 >= 50%` 时才阻止启动。 `some.avg10` 和 `full.avg10` 是 pressure observation，不是 CPU usage 或 allocation count。
 
@@ -53,7 +53,7 @@ Incus pool metrics 与 guest filesystem metrics 描述的是不同层次。 Imag
 
 ## 部署实现
 
-1. 在拥有部署配置的仓库中复制[公共观测配置示例](../../../deploy/observability/observability.config.json.example)，填写部署方负责的值，把 `dashboard_path` 设置为 Grafana 容器内稳定的 `current` 目录，然后使用 `render_observability_dashboard.ts` 或部署方记录的 split-render wrapper 渲染两个 dashboard 和 provisioning 输出。Renderer 通过原子 `current` symlink 发布 dashboard pair，provisioning YAML 通过一次临时文件加 rename 安装。
+1. 在拥有部署配置的仓库中复制[公共观测配置示例](../../../skills/agent-vm-ops/assets/observability/observability.config.json.example)，填写部署方负责的值，把 `dashboard_path` 设置为 Grafana 容器内稳定的 `current` 目录，然后使用 `skills/agent-vm-ops/scripts/render_observability_dashboard.ts` 或部署方记录的 split-render wrapper 渲染两个 dashboard 和 provisioning 输出。Renderer 通过原子 `current` symlink 发布 dashboard pair，provisioning YAML 通过一次临时文件加 rename 安装。
 2. 把 Prometheus scrape target 指向部署控制服务的内部 `agent-vm-deployd /metrics` endpoint，并把 `controller_job` 设置为 `agent-vm-deployd`。不要把槽位 textfile、snapshot 文件或独立 bridge 作为第二个 scrape target。
 3. 把 CT root 和 `/var/lib/incus/images` filesystem series 纳入 deployd 的最终输出。不得从 `incus_project_limit`、guest rootfs size 或 pool free space 推导这些 series。
 4. 使用 `validate_observability_dashboard.ts` 检查渲染文件，然后审查生成 diff。部署方可以在拥有部署配置的仓库中增加专用 panel，但必须记录每个 panel 的数据权威。

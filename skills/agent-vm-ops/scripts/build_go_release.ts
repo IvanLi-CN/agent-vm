@@ -46,8 +46,9 @@ if (!isAbsolute(rawOutput)) throw new Error("output must be absolute");
 const output = resolve(rawOutput);
 if (existsSync(output)) throw new Error(`output already exists: ${output}`);
 
-const clientRoot = resolve(import.meta.dir, "../../agent-vm/scripts");
+const clientRoot = resolve(import.meta.dir, ".");
 const opsRoot = resolve(import.meta.dir, "..");
+const repositoryRoot = resolve(opsRoot, "../..");
 const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-go-release-"));
 const binaryPaths = {
   server: join(temporaryRoot, "bin/agent-vm-server"),
@@ -60,6 +61,7 @@ function digest(path: string): string {
 
 function sourcePath(relative: string): string {
   if (relative === "agent_vm_control_bridge.ts") return join(import.meta.dir, relative);
+  if (relative === "release_manifest.py") return join(repositoryRoot, "deploy", "scripts", relative);
   if (relative === "systemd/agent-vm-native.service") return join(opsRoot, "..", "..", "deploy", "assets", relative);
   if (relative === "systemd/agent-vm-native@.service") return join(opsRoot, "..", "..", "deploy", "assets", relative);
   if (relative === "systemd/agent-vm-deployd.service") return join(opsRoot, "..", "..", "deploy", "assets", relative);
