@@ -94,11 +94,52 @@ func prepareMigrationObserver(ctx context.Context, materials string) error {
 }
 
 func migrationObserverUnit(service []byte) ([]byte, error) {
-	original := []byte("\nExecStart=/opt/agent-vm-native/bin/agent-vm-deploy host-observe\n")
-	if bytes.Count(service, original) != 1 {
-		return nil, errors.New("read-only host observation service does not use the expected command")
+	return migrationHelperUnit(service, "host-observe")
+}
+
+func migrationHelperUnit(service []byte, action string) ([]byte, error) {
+	switch action {
+	case "host-observe", "host-action", "slot-relay":
+	default:
+		return nil, errors.New("invalid migration helper action")
 	}
-	return bytes.Replace(service, original, []byte("\nExecStart="+migrationDeployBinary+" host-observe\n"), 1), nil
+	original := []byte("\nExecStart=/opt/agent-vm-native/bin/agent-vm-deploy " + action + "\n")
+	if bytes.Count(service, original) != 1 {
+		return nil, errors.New("migration helper service does not use the expected command")
+	}
+	return bytes.Replace(service, original, []byte("\nExecStart="+migrationDeployBinary+" "+action+"\n"), 1), nil
+}
+
+func prepareHandoffSockets(ctx context.Context, materials string) error {
+	units := filepath.Join(materials, "assets/systemd")
+	const systemd = "/etc/systemd/system"
+	for _, helper := range []struct{ name, action string }{
+		{"agent-vm-deploy-host@.service", "host-action"},
+		{"agent-vm-slot-relay@.service", "slot-relay"},
+	} {
+		content, err := os.ReadFile(filepath.Join(units, helper.name))
+		if err != nil {
+			return err
+		}
+		content, err = migrationHelperUnit(content, helper.action)
+		if err != nil {
+			return err
+		}
+		if err := installFile(filepath.Join(systemd, helper.name), content, 0644, ""); err != nil {
+			return err
+		}
+	}
+	for _, filename := range []string{"agent-vm-deploy-host.socket", "agent-vm-slot-relay.socket", "agent-vm-deployd.socket"} {
+		if err := copyInstall(filepath.Join(units, filename), filepath.Join(systemd, filename), 0644, ""); err != nil {
+			return err
+		}
+	}
+	if err := command(ctx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
+		return err
+	}
+	// The API socket still belongs to the old daemon. It is pulled in by
+	// the new service's Requires= only after the old process has stopped.
+	return command(ctx, "/usr/bin/systemctl", "start", "agent-vm-deploy-host.socket", "agent-vm-slot-relay.socket")
 }
 
 func prepareFreshAccounts(ctx context.Context, materials string) error {

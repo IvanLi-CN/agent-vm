@@ -25,9 +25,16 @@ const deploymentUnit = "agent-vm-deployd.service"
 // handoffDeploymentUnit keeps the incumbent unit definition in place up to
 // the point the journal transfer succeeds. The passed materials are from the
 // verified, private installation snapshot.
-func handoffDeploymentUnit(ctx context.Context, handoff deployd.AccountHandoff, materials string) error {
+func handoffDeploymentUnit(ctx context.Context, handoff deployd.AccountHandoff, input Inputs) error {
+	materials := input.Materials
 	account, err := os.ReadFile(filepath.Join(materials, "assets/systemd/fresh-deploy-account.conf"))
 	if err != nil {
+		return err
+	}
+	if err := prepareHandoffAccount(ctx, input); err != nil {
+		return err
+	}
+	if err := prepareHandoffSockets(ctx, materials); err != nil {
 		return err
 	}
 	steady, adopt := deploymentAccountDropIns(account)
@@ -57,6 +64,27 @@ func handoffDeploymentUnit(ctx context.Context, handoff deployd.AccountHandoff, 
 		return fmt.Errorf("controller adopted; systemd configuration reload failed: %w", err)
 	}
 	return nil
+}
+
+func prepareHandoffAccount(ctx context.Context, input Inputs) error {
+	cfg, err := LoadConfig(input.Config)
+	if err != nil {
+		return err
+	}
+	assets := filepath.Join(input.Materials, "assets")
+	if err := command(ctx, "/usr/bin/systemd-sysusers", filepath.Join(assets, "sysusers.d/agent-vm-native.conf")); err != nil {
+		return err
+	}
+	for _, rule := range []struct{ file, prefix string }{
+		{"agent-vm-native.conf", "/etc/agent-vm-native/backup"},
+		{"agent-vm-native.conf", "/var/lib/agent-vm-native/routing"},
+		{"agent-vm-fresh-accounts.conf", filepath.Dir(deployd.DedicatedDatabase)},
+	} {
+		if err := command(ctx, "/usr/bin/systemd-tmpfiles", "--create", "--prefix="+rule.prefix, filepath.Join(assets, "tmpfiles.d", rule.file)); err != nil {
+			return err
+		}
+	}
+	return installBackupInputs(cfg)
 }
 
 func deploymentAccountDropIns(account []byte) (steady, adopt []byte) {
