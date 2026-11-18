@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/manifest"
 )
+
+const migrationDeployBinary = "/opt/agent-vm-native/maintenance/agent-vm-deploy"
 
 // prepareLegacyCandidateUnit is called with privately staged and validated
 // installation inputs under the release-update lock, before the incumbent daemon
@@ -39,7 +42,10 @@ func prepareLegacyCandidateUnit(ctx context.Context, activeSlot, materials, prod
 	if err != nil || !stoppedAccountSlot(string(status)) {
 		return errors.New("account migration requires the candidate slot to be stopped")
 	}
-	if err := copyInstall(filepath.Join(product, "bin", "agent-vm-deploy"), "/opt/agent-vm-native/maintenance/agent-vm-deploy", 0700, ""); err != nil {
+	if err := copyInstall(filepath.Join(product, "bin", "agent-vm-deploy"), migrationDeployBinary, 0700, ""); err != nil {
+		return err
+	}
+	if err := prepareMigrationObserver(ctx, materials); err != nil {
 		return err
 	}
 	dir := filepath.Join("/etc/systemd/system", unit+".d")
@@ -56,6 +62,39 @@ func prepareLegacyCandidateUnit(ctx context.Context, activeSlot, materials, prod
 		return err
 	}
 	return command(ctx, "/usr/bin/systemctl", "daemon-reload")
+}
+
+func prepareMigrationObserver(ctx context.Context, materials string) error {
+	units := filepath.Join(materials, "assets/systemd")
+	const observer = "agent-vm-observe@.service"
+	const socket = "agent-vm-observe.socket"
+	const systemd = "/etc/systemd/system"
+	service, err := os.ReadFile(filepath.Join(units, observer))
+	if err != nil {
+		return err
+	}
+	service, err = migrationObserverUnit(service)
+	if err != nil {
+		return err
+	}
+	if err := installFile(filepath.Join(systemd, observer), service, 0644, ""); err != nil {
+		return err
+	}
+	if err := copyInstall(filepath.Join(units, socket), filepath.Join(systemd, socket), 0644, ""); err != nil {
+		return err
+	}
+	if err := command(ctx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
+		return err
+	}
+	return command(ctx, "/usr/bin/systemctl", "start", socket)
+}
+
+func migrationObserverUnit(service []byte) ([]byte, error) {
+	original := []byte("\nExecStart=/opt/agent-vm-native/bin/agent-vm-deploy host-observe\n")
+	if bytes.Count(service, original) != 1 {
+		return nil, errors.New("read-only host observation service does not use the expected command")
+	}
+	return bytes.Replace(service, original, []byte("\nExecStart="+migrationDeployBinary+" host-observe\n"), 1), nil
 }
 
 func prepareFreshAccounts(ctx context.Context, materials string) error {
