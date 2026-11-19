@@ -1159,6 +1159,7 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 		{"active-link-unavailable", 10, "source-active_link", 1, true, false},
 		{"systemd-unavailable", 10, "source-systemd", 1, true, false},
 		{"role-channel-unavailable", 10, "source-slot_contracts", 1, true, false},
+		{"native-observation-unavailable", 10, "source-native_observation", 1, true, false},
 		{"foreign-owner", 1, "owner", 1, true, false},
 		{"missing-lease", 1, "lease", 1, true, false},
 		{"expired-lease", 1, "expired", 1, true, false},

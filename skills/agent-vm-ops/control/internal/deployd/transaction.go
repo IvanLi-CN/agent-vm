@@ -1055,7 +1055,7 @@ func (manager *Manager) retryableControllerObservation(observation RuntimeSnapsh
 			return false
 		}
 	}
-	for _, name := range []string{"active_link", "systemd", "slot_contracts"} {
+	for _, name := range []string{"active_link", "systemd", "slot_contracts", "native_observation"} {
 		source, present := observation.Sources[name]
 		if !present || !source.Up || source.ObservedAt.IsZero() || source.ObservedAt.After(now) || source.FreshUntil.IsZero() || !source.FreshUntil.After(now) {
 			return false
