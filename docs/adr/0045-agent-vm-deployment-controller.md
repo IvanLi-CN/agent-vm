@@ -36,6 +36,7 @@ Agent VM 的蓝绿部署需要在同一控制环境内持续观察两个并行�
   切换期间两个进程可以同时存活，旧槽位必须先进入 `retiring` 并排空，再允许停止。
 - 正常事务顺序是 stage、standby validation、controller handoff、traffic enable、原子切换 `active`、旧槽位 drain、quiescence、finalize。
   任何 readiness、state capability、epoch、worker、请求排空或主权证据不确定时都 fail closed。
+- inventory 观测的 timeout 或不完整只使部署观测不完整，阻止 stage、activate、切流和 rollback；它不单独表示数据库或业务服务不可用。若其他权威来源与现役 controller lease 仍新鲜有效，Deployd 保留现役 traffic role 和同一 lease，不执行独立的 `DisableTraffic` 或 `fenceSlots`；rqlite 强读、服务健康、活动角色或 lease 失败仍按现有规则 hard-fence。
 
 ## 后果
 

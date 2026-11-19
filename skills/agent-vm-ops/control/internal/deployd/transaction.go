@@ -534,15 +534,18 @@ func (manager *Manager) Rollback(ctx context.Context, id string) (*store.Transac
 	if err != nil || transaction == nil {
 		return transaction, errOrNotFound(err, id, transaction)
 	}
+	// Rollback is a destructive deployment operation. Observe the runtime
+	// without a transaction identity first, so an incomplete inventory cannot
+	// reach slot verification or a native rollback effect.
+	observation, err := manager.completeRuntimeObservation(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if transaction.RollbackUsed && transaction.Phase != PhaseRollback {
 		return nil, errors.New("transaction rollback is already used")
 	}
 	if transaction.State == "finalized" && manager.usesRecoveryPoints() {
 		if err := manager.ensureNoActiveTransaction(ctx); err != nil {
-			return nil, err
-		}
-		observation, err := manager.observe(ctx, id)
-		if err != nil {
 			return nil, err
 		}
 		if !validObservation(observation, manager.Clock().UTC()) || observation.ActiveSlot != transaction.TargetSlot {
@@ -563,6 +566,20 @@ func (manager *Manager) Rollback(ctx context.Context, id string) (*store.Transac
 		return nil, err
 	}
 	return manager.Store.Get(ctx, id)
+}
+
+func (manager *Manager) completeRuntimeObservation(ctx context.Context) (RuntimeSnapshot, error) {
+	observation, err := manager.observe(ctx, "")
+	if err != nil {
+		return RuntimeSnapshot{}, err
+	}
+	if observation.ControllerRecoveryOnly {
+		return RuntimeSnapshot{}, errors.New("rollback requires a complete runtime observation")
+	}
+	if !observation.Consistent {
+		return RuntimeSnapshot{}, manager.fenceSlots(ctx, errors.New("rollback runtime observation is inconsistent"))
+	}
+	return observation, nil
 }
 
 func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.Transaction, error) {
@@ -633,6 +650,9 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 	case "rollback":
 		if transaction.RollbackUsed && transaction.Phase != PhaseRollback {
 			return nil, errors.New("transaction rollback is already used")
+		}
+		if _, err := manager.completeRuntimeObservation(ctx); err != nil {
+			return nil, err
 		}
 		if err := manager.rollback(ctx, *transaction); err != nil {
 			return nil, err
@@ -895,7 +915,7 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	}
 	controllerObservation := observation
 	controllerObservation.Consistent = observation.Consistent || observation.ControllerRecoveryOnly
-	if !validObservation(controllerObservation, manager.Clock().UTC()) {
+	if !validObservation(controllerObservation, manager.Clock().UTC()) && !validControllerRecoveryObservation(observation, manager.Clock().UTC()) {
 		// Business snapshot consistency controls traffic, while fresh process,
 		// singleton and active-link evidence independently verifies the existing
 		// writer. Preserve its exact live identity so in-flight effects and lease
@@ -924,33 +944,28 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	if !ok || !target.ProcessUp || !target.ProcessReady || target.StateEpoch == "" || len(target.StateCapabilities) == 0 {
 		return manager.fenceSlots(ctx, errors.New("active slot is not process-ready"))
 	}
-	if observation.ControllerRecoveryOnly && !target.Draining {
-		// A coherent but incomplete inventory is normal while Incus stops or
-		// deletes a guest. It cannot authorize a new controller, but must not
-		// cancel work owned by this process's still-live controller lease.
+	if observation.ControllerRecoveryOnly {
+		// Inventory is a deployment-readiness input, not proof that the active
+		// service or database is unavailable. Preserve the verified live role and
+		// its traffic state until a complete inventory is available again.
 		current := target.ControllerLease
 		if !target.LeaseRenewalSupported || !target.ControllerOwned || current == nil ||
 			current.Validate(manager.Clock(), target.Slot) != nil || current.OwnerPID != os.Getpid() ||
 			current.OwnerStartTime == "" || current.OwnerStartTime != controllerrole.ProcessStartToken(os.Getpid()) {
-			return manager.fenceSlots(ctx, errors.New("partial inventory requires admission drain before controller recovery"))
+			return manager.fenceSlots(ctx, errors.New("inventory observation requires a valid active controller lease"))
 		}
 		for slot, value := range observation.Slots {
-			if slot != observation.ActiveSlot && value.ControllerOwned {
-				return manager.fenceSlots(ctx, errors.New("partial inventory has more than one controller"))
+			if slot != observation.ActiveSlot && (value.ControllerOwned || value.TrafficAccepting) {
+				return manager.fenceSlots(ctx, errors.New("inventory observation has an unresolved inactive role"))
 			}
 		}
 		original := *current
-		for _, slot := range []string{"blue", "green"} {
-			if err := manager.Runtime.DisableTraffic(ctx, slot); err != nil {
-				return manager.fenceSlots(ctx, errors.New("disable traffic during partial inventory failed"))
-			}
-		}
 		lease, err := manager.renewOrAllocateLease(ctx, target, original.Generation, &original)
 		if err != nil {
-			return manager.fenceSlots(ctx, errors.New("partial inventory controller lease expired or changed"))
+			return manager.fenceSlots(ctx, errors.New("inventory observation controller lease expired or changed"))
 		}
 		if err := manager.Runtime.GrantController(ctx, observation.ActiveSlot, lease); err != nil {
-			return manager.fenceSlots(ctx, errors.New("partial inventory controller renewal failed"))
+			return manager.fenceSlots(ctx, errors.New("inventory observation controller renewal failed"))
 		}
 		return nil
 	}
@@ -1040,7 +1055,7 @@ func (manager *Manager) retryableControllerObservation(observation RuntimeSnapsh
 			return false
 		}
 	}
-	for _, name := range []string{"active_link", "systemd", "slot_contracts"} {
+	for _, name := range []string{"active_link", "systemd", "slot_contracts", "native_observation"} {
 		source, present := observation.Sources[name]
 		if !present || !source.Up || source.ObservedAt.IsZero() || source.ObservedAt.After(now) || source.FreshUntil.IsZero() || !source.FreshUntil.After(now) {
 			return false
@@ -1529,6 +1544,24 @@ func validObservation(observation RuntimeSnapshot, now time.Time) bool {
 		return false
 	}
 	for _, source := range observation.Sources {
+		if !source.Up || source.ObservedAt.IsZero() || source.ObservedAt.After(now) || source.FreshUntil.IsZero() || !source.FreshUntil.After(now) || source.ObservedAt.Before(observation.ObservedAt.Add(-2*time.Second)) {
+			return false
+		}
+	}
+	return true
+}
+
+func validControllerRecoveryObservation(observation RuntimeSnapshot, now time.Time) bool {
+	if !observation.ControllerRecoveryOnly || observation.Consistent || observation.ObservedAt.IsZero() || len(observation.Sources) == 0 {
+		return false
+	}
+	if _, ok := observation.Sources["inventory_observation"]; !ok {
+		return false
+	}
+	for name, source := range observation.Sources {
+		if name == "inventory_observation" {
+			continue
+		}
 		if !source.Up || source.ObservedAt.IsZero() || source.ObservedAt.After(now) || source.FreshUntil.IsZero() || !source.FreshUntil.After(now) || source.ObservedAt.Before(observation.ObservedAt.Add(-2*time.Second)) {
 			return false
 		}

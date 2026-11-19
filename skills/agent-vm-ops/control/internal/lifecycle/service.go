@@ -3551,6 +3551,12 @@ func (s *Service) drainStatus(ctx context.Context) (map[string]any, error) {
 	return map[string]any{"draining": draining, "ready": s.Ready(), "state_capabilities": stateCapabilities}, nil
 }
 
+const (
+	adminStatusProbeConcurrency = 8
+	adminStatusItemDeadline     = 2 * time.Second
+	adminStatusPageDeadline     = 8 * time.Second
+)
+
 func (s *Service) adminStatus(ctx context.Context, requests ...protocol.Request) (map[string]any, error) {
 	request := protocol.Request{}
 	if len(requests) > 0 && requests[0] != nil {
@@ -3579,7 +3585,7 @@ func (s *Service) adminStatus(ctx context.Context, requests ...protocol.Request)
 	}
 
 	observedAt := nowString(s.Clock())
-	pageCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	pageCtx, cancel := context.WithTimeout(ctx, adminStatusPageDeadline)
 	defer cancel()
 	startEpoch, err := s.Store.StateEpoch(pageCtx)
 	if err != nil {
@@ -3595,21 +3601,23 @@ func (s *Service) adminStatus(ctx context.Context, requests ...protocol.Request)
 	timedOut := 0
 	unknown := 0
 	results := make(chan adminStatusProbeResult, len(tasks))
-	semaphore := make(chan struct{}, 8)
+	semaphore := make(chan struct{}, adminStatusProbeConcurrency)
 	for index := range tasks {
 		go func(index int) {
-			itemCtx, itemCancel := context.WithTimeout(pageCtx, time.Second)
-			defer itemCancel()
 			started := time.Now()
 			select {
 			case semaphore <- struct{}{}:
-			case <-itemCtx.Done():
-				item := adminStatusProbeTimeout(&tasks[index], itemCtx.Err())
+			case <-pageCtx.Done():
+				item := adminStatusProbeTimeout(&tasks[index], pageCtx.Err())
 				item["latency_ms"] = time.Since(started).Milliseconds()
 				results <- adminStatusProbeResult{index: index, item: item, timedOut: true}
 				return
 			}
 			defer func() { <-semaphore }()
+			// Queueing for a probe slot is not probe work. Start the item
+			// deadline only after the bounded concurrency slot is acquired.
+			itemCtx, itemCancel := context.WithTimeout(pageCtx, adminStatusItemDeadline)
+			defer itemCancel()
 			item, summaryErr := s.summary(itemCtx, &tasks[index])
 			if itemCtx.Err() != nil {
 				item = adminStatusProbeTimeout(&tasks[index], itemCtx.Err())

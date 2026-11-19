@@ -268,11 +268,13 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		inventory, inventoryAt, inventoryErr := readSource("inventory", "admin-status")
 		if inventoryErr != nil {
 			inventoryObservationUp = false
+			inventoryComplete = false
 			runtime.invalidateMetrics(slot, "inventory")
 			snapshot.Consistent = false
 		} else {
 			inventoryConsistent := inventoryObservationCoherent(inventory)
 			if !inventoryConsistent {
+				inventoryComplete = false
 				snapshot.Consistent = false
 			}
 			if inventoryConsistent {
@@ -383,10 +385,37 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 	}
 	snapshot.FreshUntil = composedFreshUntil(snapshot.Sources, now)
 	if !inventoryComplete {
-		snapshot.ControllerRecoveryOnly = snapshot.Consistent
+		snapshot.ControllerRecoveryOnly = inventoryOnlyControllerRecovery(snapshot, now)
 		snapshot.Consistent = false
 	}
 	return snapshot, nil
+}
+
+func inventoryOnlyControllerRecovery(snapshot RuntimeSnapshot, now time.Time) bool {
+	if snapshot.ActiveSlot == "" || snapshot.ActiveSlot == "none" || snapshot.ControllerSlot != snapshot.ActiveSlot || snapshot.ObservedAt.IsZero() {
+		return false
+	}
+	active, ok := snapshot.Slots[snapshot.ActiveSlot]
+	if !ok || !active.ProcessUp || !active.ProcessReady || !active.ControllerOwned || !active.LeaseRenewalSupported || active.ControllerLease == nil || active.ControllerLease.Validate(now, active.Slot) != nil {
+		return false
+	}
+	for slot, observation := range snapshot.Slots {
+		if slot != snapshot.ActiveSlot && (observation.ControllerOwned || observation.TrafficAccepting) {
+			return false
+		}
+	}
+	if _, ok := snapshot.Sources["inventory_observation"]; !ok {
+		return false
+	}
+	for name, source := range snapshot.Sources {
+		if name == "inventory_observation" {
+			continue
+		}
+		if !source.Up || source.ObservedAt.IsZero() || source.ObservedAt.After(now) || source.FreshUntil.IsZero() || !source.FreshUntil.After(now) || source.ObservedAt.Before(snapshot.ObservedAt.Add(-2*time.Second)) {
+			return false
+		}
+	}
+	return true
 }
 
 func inventoryObservationCoherent(inventory map[string]any) bool {

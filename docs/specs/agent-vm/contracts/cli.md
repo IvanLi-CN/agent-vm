@@ -124,9 +124,9 @@ SSH 控制传输调用远端固定的 Go 请求适配器 `/opt/agent-vm-native/b
 
 `admin status` 的任务摘要包括任务、实例与会话标识，生命周期及原生状态，来宾可用性，请求资源，有效租约、截止时间、SSH 映射和最后错误的代码及阶段。协议动作 `admin-status` 接受可选的数值 `limit` 和任务 ID `cursor`；默认每页 25 条，上限 100，超过上限必须拒绝。这是协议能力，不表示 CLI 已提供对应选项。
 
-每页最多并发 8 次原生只读探测，单次截止时间为 1 秒，整页为 5 秒。响应包含 `limit`、`next_cursor`、`partial`、`unknown`、`observation_consistent`、`probed`、`verified` 和 `timed_out`。无法验证时，任务的 `native_status` 为 `unknown`、`verified=false`，并计入 `unknown`；`native_missing` 只是观测细节，不是新的生命周期状态。
+每页最多并发 8 次原生只读探测；任务拿到并发槽位后拥有 2 秒截止时间，整页截止时间为 8 秒，排队时间不消耗任务探测预算。响应包含 `limit`、`next_cursor`、`partial`、`unknown`、`observation_consistent`、`probed`、`verified` 和 `timed_out`。无法验证时，任务的 `native_status` 为 `unknown`、`verified=false`，并计入 `unknown`；`native_missing` 只是观测细节，不是新的生命周期状态。
 
-部署控制器可以按任务 ID 关联指标与清单，但不能暴露原始错误文本、凭据或部署文件路径。成功抓取后移除过期任务行；读取或解析任一来源失败时报告 `up=0` 和数据新鲜度故障。容量指标和清单的独立采样规则见[观测合同](observability.md)。
+部署控制器可以按任务 ID 关联指标与清单，但不能暴露原始错误文本、凭据或部署文件路径。成功抓取后移除过期任务行；读取或解析任一来源失败时报告 `up=0` 和数据新鲜度故障。inventory 的 timeout 或 partial 只阻止 stage、activate、切流和 rollback，不单独证明数据库或业务服务不可用，也不单独触发 `DisableTraffic` 或 `fenceSlots`；rqlite 强读、服务健康、活动角色或 controller lease 的失败继续按部署控制器合同全局 fencing。容量指标和清单的独立采样规则见[观测合同](observability.md)。
 
 ## 请求与响应
 

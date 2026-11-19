@@ -43,7 +43,8 @@ wake calls the lane directly, so it creates no timer journal operation. Legacy
 
 `admin-status` is a read-only keyset-paginated observation. It defaults to 25
 tasks and accepts at most 100. It uses at most 8 concurrent probes, with a
-1-second item deadline and a 5-second page deadline. The response includes
+2-second item deadline that starts after a probe acquires a concurrency slot,
+and an 8-second page deadline. The response includes
 `partial`, `unknown`, `observation_consistent`, `probed`, `verified` and
 `timed_out`; an unknown observation is never reported as healthy.
 
@@ -59,7 +60,10 @@ their original operation identity and evidence. A maintenance failure may
 remain visible for a backoff interval, but it cannot silently skip the failed
 task. Inventory pages are bounded and useful under partial native availability;
 callers must handle `partial` and `unknown` rather than infer readiness from
-the presence of task rows.
+the presence of task rows. An incomplete or timed-out inventory is a deployment
+readiness failure, not by itself evidence that the database or business service
+is unavailable; Deployd preserves a verified active role and traffic while the
+other authority sources and controller lease remain healthy.
 
 The cursor is metadata, not a replacement for the operation journal. It may be
 rewound by restoring the database and journal together, but it must not be
