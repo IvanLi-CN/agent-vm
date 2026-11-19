@@ -20,6 +20,11 @@ import (
 
 const Version = 4
 
+// LegacyProtocolReleaseID identifies a source client that has no formal
+// release identity. Its capability window is still validated normally, but it
+// is not a release identity to compare against the installed control version.
+const LegacyProtocolReleaseID = "legacy-protocol-4"
+
 var (
 	SessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.:@/-]{1,160}$`)
 	TaskIDPattern    = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,47}$`)
@@ -541,7 +546,7 @@ func ValidateCompatibility(request Request, release *ReleaseMetadata) ([]any, *E
 		return nil, NewError("response_semantic_incompatible", "control response semantic revision is not accepted by the client", map[string]any{"action": action})
 	}
 	releaseID, ok := peer["release_id"].(string)
-	if !ok || releaseID == "" || (releaseID != "legacy-protocol-4" && !revisionPattern.MatchString(releaseID)) {
+	if !ok || releaseID == "" || (releaseID != LegacyProtocolReleaseID && !revisionPattern.MatchString(releaseID)) {
 		return nil, NewError("compatibility_invalid", "compatibility.release_id must be a Git revision or legacy-protocol-4", map[string]any{"action": action})
 	}
 	if legacy, exists := peer["legacy"]; exists {
@@ -549,7 +554,7 @@ func ValidateCompatibility(request Request, release *ReleaseMetadata) ([]any, *E
 			return nil, NewError("compatibility_invalid", "compatibility.legacy must be a boolean", map[string]any{"action": action})
 		}
 	}
-	if releaseID == release.ReleaseID {
+	if releaseID == LegacyProtocolReleaseID || releaseID == release.ReleaseID {
 		return nil, nil
 	}
 	return []any{map[string]any{

@@ -3114,6 +3114,51 @@ func TestCompatibleReleaseWarningAndMetadataSurviveReplay(t *testing.T) {
 	}
 }
 
+func TestLegacyProtocolIdentityAndMetadataSurviveReplayWithoutWarning(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	actions := make(map[string]protocol.ActionCompatibility, len(protocol.Actions))
+	for action := range protocol.Actions {
+		actions[action] = protocol.ActionCompatibility{
+			Request: protocol.Schema{Schema: 1, SemanticRevision: 1}, Response: protocol.Schema{Schema: 1, SemanticRevision: 1},
+			RequestWindow: protocol.CompatibilityWindow{SchemaMin: 1, SchemaMax: 1, SemanticMin: 1, SemanticMax: 1}, ResponseWindow: protocol.CompatibilityWindow{SchemaMin: 1, SchemaMax: 1, SemanticMin: 1, SemanticMax: 1},
+		}
+	}
+	releaseID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	service := New(store, config.Defaults(), Options{Release: &protocol.ReleaseMetadata{ReleaseID: releaseID, SourceRevision: releaseID, Protocol: protocol.Version, Transport: "go-request", ManifestPresent: true, ArtifactsVerified: true, Actions: actions}})
+	request := protocol.Request{
+		"protocol": protocol.Version, "action": "drain-enter", "generation": int64(0), "operation_id": "legacy-warning-free-operation",
+		"compatibility": map[string]any{
+			"release_id": protocol.LegacyProtocolReleaseID, "protocol": protocol.Version, "action": "drain-enter",
+			"request":           map[string]any{"schema": int64(1), "semantic_revision": int64(1)},
+			"accepted_response": map[string]any{"schema_min": int64(1), "schema_max": int64(1), "semantic_min": int64(1), "semantic_max": int64(1)},
+		},
+	}
+	response, err := service.Dispatch(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response["release"].(map[string]any)["release_id"] != releaseID {
+		t.Fatalf("response metadata = %#v", response)
+	}
+	if warnings, ok := response["warnings"].([]any); !ok || len(warnings) != 0 {
+		t.Fatalf("unexpected warnings = %#v", response["warnings"])
+	}
+	replayed, err := service.Dispatch(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed["outcome"] != "replayed" || replayed["release"].(map[string]any)["release_id"] != releaseID {
+		t.Fatalf("replayed response = %#v", replayed)
+	}
+	if warnings, ok := replayed["warnings"].([]any); !ok || len(warnings) != 0 {
+		t.Fatalf("unexpected replay warnings = %#v", replayed["warnings"])
+	}
+}
+
 func TestResidentServiceRefusesAdmissionBeforeStartupReconcile(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
