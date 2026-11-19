@@ -110,6 +110,17 @@ func prepareHandoffAccount(ctx context.Context, input Inputs) error {
 	if err := command(ctx, "/usr/bin/systemd-sysusers", filepath.Join(assets, "sysusers.d/agent-vm-native.conf")); err != nil {
 		return err
 	}
+	expected, err := matchingCandidateConfig(targets["deployd_config"].path, cfg.Files["deployd_config"])
+	if err != nil {
+		return fmt.Errorf("validate deployment configuration before account handoff: %w", err)
+	}
+	_, gid, err := dedicatedDeploymentIDs()
+	if err != nil {
+		return err
+	}
+	if err := grantCandidateConfigRead(targets["deployd_config"].path, expected, gid); err != nil {
+		return fmt.Errorf("grant deployment configuration access: %w", err)
+	}
 	for _, rule := range []struct{ file, prefix string }{
 		{"agent-vm-native.conf", "/etc/agent-vm-native/backup"},
 		{"agent-vm-native.conf", "/var/lib/agent-vm-native/routing"},
