@@ -45,6 +45,10 @@ func prepareCandidateAccess(ctx context.Context, slot string, input Inputs) erro
 	for _, rule := range []struct {
 		file, prefix string
 	}{
+		// Existing root-owned installations may have created this parent
+		// before the service-account layout was introduced. Reapply the
+		// versioned tmpfiles contract before starting the unprivileged slot.
+		{"agent-vm-native.conf", "/run/agent-vm-native"},
 		{"agent-vm-native.conf", filepath.Dir(targetFile)},
 		{"agent-vm-native.conf", "/etc/agent-vm-native/incus"},
 		{"agent-vm-fresh-accounts.conf", deployd.ServerRuntimeHome},

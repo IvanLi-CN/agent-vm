@@ -49,6 +49,12 @@ func prepareLegacyCandidateUnit(ctx context.Context, activeSlot string, input In
 	if err := prepareCandidateAccess(ctx, candidate, input); err != nil {
 		return err
 	}
+	// The migration drop-in starts the candidate as agent-vm-server. Open the
+	// incumbent tree first so a failed candidate can be restarted by the same
+	// drop-in during the coordinator's stage compensation.
+	if err := PrepareLegacySlotAccess(activeSlot); err != nil {
+		return fmt.Errorf("prepare incumbent slot access for account migration: %w", err)
+	}
 	if err := copyInstall(filepath.Join(product, "bin", "agent-vm-deploy"), migrationDeployBinary, 0755, ""); err != nil {
 		return err
 	}

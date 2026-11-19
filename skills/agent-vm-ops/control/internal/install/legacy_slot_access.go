@@ -35,6 +35,18 @@ func PrepareLegacySlotAccess(slot string) error {
 			break
 		}
 	}
+	// Preserve root ownership while allowing the service account to traverse
+	// the setgid slot root and keeping newly staged directories in the web group.
+	if err := os.Lchown(slots, 0, int(gid)); err != nil {
+		return err
+	}
+	info, err := os.Stat(slots)
+	if err != nil {
+		return err
+	}
+	if err := os.Chmod(slots, info.Mode().Perm()|os.ModeSetgid); err != nil {
+		return err
+	}
 	return openLegacySlotDirectories(filepath.Join(slots, slot), filepath.Join("/run/agent-vm-native", slot, "app.sock"), 0, uint32(gid))
 }
 
@@ -47,7 +59,7 @@ func rootProtected(info fs.FileInfo, uid uint32) bool {
 }
 
 func openLegacySlotDirectories(directory, socket string, uid, gid uint32) error {
-	var changes []string
+	var groupChanges, modeChanges []string
 	err := filepath.WalkDir(directory, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -66,11 +78,15 @@ func openLegacySlotDirectories(directory, socket string, uid, gid uint32) error 
 			return errors.New("legacy slot contains an unprotected entry")
 		}
 		if info.IsDir() {
-			if info.Sys().(*syscall.Stat_t).Gid != gid {
+			currentGID := info.Sys().(*syscall.Stat_t).Gid
+			if currentGID != gid && currentGID != 0 {
 				return errors.New("legacy slot directory does not belong to the slot access group")
 			}
+			if currentGID != gid {
+				groupChanges = append(groupChanges, path)
+			}
 			if info.Mode().Perm() != 0750 {
-				changes = append(changes, path)
+				modeChanges = append(modeChanges, path)
 			}
 		}
 		return nil
@@ -78,7 +94,12 @@ func openLegacySlotDirectories(directory, socket string, uid, gid uint32) error 
 	if err != nil {
 		return err
 	}
-	for _, path := range changes {
+	for _, path := range groupChanges {
+		if err := os.Lchown(path, int(uid), int(gid)); err != nil {
+			return err
+		}
+	}
+	for _, path := range modeChanges {
 		if err := os.Chmod(path, 0750); err != nil {
 			return err
 		}
