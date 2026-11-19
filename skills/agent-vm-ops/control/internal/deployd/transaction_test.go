@@ -1133,9 +1133,6 @@ func (runtime *changingObservationRuntime) Observe(ctx context.Context) (Runtime
 	}
 	if runtime.reads <= runtime.unstableReads {
 		snapshot.Consistent = false
-		source := snapshot.Sources["native_observation"]
-		source.Up = false
-		snapshot.Sources["native_observation"] = source
 	}
 	return snapshot, err
 }
