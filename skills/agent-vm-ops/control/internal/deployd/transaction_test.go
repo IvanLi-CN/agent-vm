@@ -27,6 +27,7 @@ type fakeRuntime struct {
 	preflightCalls        int
 	inconsistent          bool
 	partialInventory      bool
+	inventoryUnavailable  bool
 	identityError         error
 	stateEpoch            string
 	capabilities          []string
@@ -86,7 +87,11 @@ func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
 	for _, source := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
 		sources[source] = SourceObservation{Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)}
 	}
-	return RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), ActiveSlot: runtime.active, ControllerSlot: runtime.active, Consistent: !runtime.inconsistent && !runtime.partialInventory, ControllerRecoveryOnly: runtime.partialInventory && !runtime.inconsistent, Slots: slots, Sources: sources}, nil
+	inventoryIncomplete := runtime.partialInventory || runtime.inventoryUnavailable
+	if runtime.inventoryUnavailable {
+		sources["inventory_observation"] = SourceObservation{ObservedAt: now, FreshUntil: now, Error: "inventory observation timed out"}
+	}
+	return RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), ActiveSlot: runtime.active, ControllerSlot: runtime.active, Consistent: !runtime.inconsistent && !inventoryIncomplete, ControllerRecoveryOnly: inventoryIncomplete && !runtime.inconsistent, Slots: slots, Sources: sources}, nil
 }
 func (runtime *fakeRuntime) Stage(context.Context, string, string) error {
 	runtime.sequence = append(runtime.sequence, "stage")
@@ -278,7 +283,7 @@ func TestManagerRejectsIncompatibleCandidateBeforeCreatingTransaction(t *testing
 }
 
 func TestStageDrainedControllerForRecovery(t *testing.T) {
-	for _, mode := range []string{"drained", "not-drained", "in-flight", "worker", "unknown-counters", "no-controller", "target-controller"} {
+	for _, mode := range []string{"drained", "not-drained", "in-flight", "worker", "unknown-counters", "no-controller", "target-controller", "partial-inventory", "inventory-timeout"} {
 		t.Run(mode, func(t *testing.T) {
 			now := time.Unix(100, 0).UTC()
 			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
@@ -302,6 +307,10 @@ func TestStageDrainedControllerForRecovery(t *testing.T) {
 				active.ControllerOwned = false
 			case "target-controller":
 				target.ControllerOwned = true
+			case "partial-inventory":
+				runtime.partialInventory = true
+			case "inventory-timeout":
+				runtime.inventoryUnavailable = true
 			}
 			runtime.observations["blue"], runtime.observations["green"] = active, target
 			manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
@@ -373,6 +382,140 @@ func TestManagerFencesUncertainActiveSwitch(t *testing.T) {
 	}
 	if current.State != "needs_recovery" || !current.RecoveryRequired {
 		t.Fatalf("uncertain transaction was not fenced: %#v", current)
+	}
+}
+
+func TestActivateRejectsIncompleteInventoryBeforeRoleEffects(t *testing.T) {
+	for _, incomplete := range []string{"partial", "timeout"} {
+		t.Run(incomplete, func(t *testing.T) {
+			now := time.Unix(100, 0).UTC()
+			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			runtime := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{
+				"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+				"green": {Slot: "green", ProcessUp: true, ProcessReady: true},
+			}}
+			manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+			transaction, err := manager.Stage(context.Background(), "green", "/tmp/release.tar")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := manager.Verify(context.Background(), transaction.ID); err != nil {
+				t.Fatal(err)
+			}
+			if incomplete == "partial" {
+				runtime.partialInventory = true
+			} else {
+				runtime.inventoryUnavailable = true
+			}
+			if _, err := manager.Activate(context.Background(), transaction.ID); err == nil {
+				t.Fatal("activate unexpectedly accepted incomplete inventory")
+			}
+			for _, action := range []string{"revoke", "grant", "traffic", "traffic-disable", "switch"} {
+				if containsSequence(runtime.sequence, action) {
+					t.Fatalf("activate applied %s before inventory recovered: %v", action, runtime.sequence)
+				}
+			}
+		})
+	}
+}
+
+func TestRollbackRejectsIncompleteInventoryBeforeNativeEffect(t *testing.T) {
+	for _, incomplete := range []string{"partial", "timeout"} {
+		t.Run(incomplete, func(t *testing.T) {
+			now := time.Unix(100, 0).UTC()
+			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			runtime := &fakeRuntime{active: "green", traffic: map[string]bool{"green": true, "blue": false}, observations: map[string]SlotObservation{
+				"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true},
+				"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+			}}
+			if incomplete == "partial" {
+				runtime.partialInventory = true
+			} else {
+				runtime.inventoryUnavailable = true
+			}
+			transaction := store.Transaction{ID: "tx-incomplete-inventory-" + incomplete, TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: PhaseActiveSwitch, State: "active", Generation: 1, CreatedAt: now, UpdatedAt: now}
+			if err := database.Create(context.Background(), transaction, map[string]any{
+				"previous_release_id": "release-blue", "previous_source_revision": "revision-1",
+				"previous_state_authority": "authority-1", "previous_state_epoch": "epoch-1",
+				"previous_state_capabilities": []string{"reads@1", "writes@1"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+			if _, err := manager.Rollback(context.Background(), transaction.ID); err == nil {
+				t.Fatal("rollback unexpectedly accepted incomplete inventory")
+			}
+			if len(runtime.sequence) != 0 {
+				t.Fatalf("rollback applied native effects before inventory recovered: %v", runtime.sequence)
+			}
+		})
+	}
+}
+
+func TestRecoveryRollbackRejectsIncompleteInventoryBeforeNativeEffect(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "green", partialInventory: true, traffic: map[string]bool{"green": true, "blue": false}, observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+	}}
+	transaction := store.Transaction{ID: "tx-recovery-incomplete-inventory", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: PhaseActiveSwitch, State: "needs_recovery", RecoveryRequired: true, Generation: 1, CreatedAt: now, UpdatedAt: now}
+	if err := database.Create(context.Background(), transaction, map[string]any{
+		"previous_release_id": "release-blue", "previous_source_revision": "revision-1",
+		"previous_state_authority": "authority-1", "previous_state_epoch": "epoch-1",
+		"previous_state_capabilities": []string{"reads@1", "writes@1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	if _, err := manager.Recover(context.Background(), transaction.ID, "rollback"); err == nil {
+		t.Fatal("recovery rollback unexpectedly accepted incomplete inventory")
+	}
+	if len(runtime.sequence) != 0 {
+		t.Fatalf("recovery rollback applied native effects before inventory recovered: %v", runtime.sequence)
+	}
+}
+
+func TestRollbackFencesIndependentObservationFailure(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "green", inconsistent: true, traffic: map[string]bool{"green": true, "blue": false}, observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+	}}
+	transaction := store.Transaction{ID: "tx-inconsistent-observation", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: PhaseActiveSwitch, State: "active", Generation: 1, CreatedAt: now, UpdatedAt: now}
+	if err := database.Create(context.Background(), transaction, map[string]any{
+		"previous_release_id": "release-blue", "previous_source_revision": "revision-1",
+		"previous_state_authority": "authority-1", "previous_state_epoch": "epoch-1",
+		"previous_state_capabilities": []string{"reads@1", "writes@1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	if _, err := manager.Rollback(context.Background(), transaction.ID); err == nil {
+		t.Fatal("rollback unexpectedly accepted an independent observation failure")
+	}
+	if !containsSequence(runtime.sequence, "traffic-disable") || !containsSequence(runtime.sequence, "fence") {
+		t.Fatalf("independent observation failure did not fence roles: %v", runtime.sequence)
+	}
+	if containsSequence(runtime.sequence, "rollback") {
+		t.Fatalf("rollback applied a native effect before fencing: %v", runtime.sequence)
 	}
 }
 
@@ -1380,14 +1523,17 @@ func TestManagerRejectsConcurrentDeploymentTransactions(t *testing.T) {
 }
 
 func TestControllerRecoveryRetainsOnlyDrainedAuthority(t *testing.T) {
+	if controllerrole.ProcessStartToken(os.Getpid()) == "" {
+		t.Skip("Linux process-incarnation evidence required")
+	}
 	for _, test := range []struct {
-		name                                     string
-		partial, draining, inconsistent, allowed bool
+		name                                                string
+		partial, draining, inconsistent, allowed, liveLease bool
 	}{
-		{"complete-drain", false, true, false, true},
-		{"partial-drain", true, true, false, true},
-		{"partial-without-drain", true, false, false, false},
-		{"inconsistent-drain", true, true, true, false},
+		{"complete-drain", false, true, false, true, false},
+		{"partial-drain", true, true, false, true, true},
+		{"partial-without-drain", true, false, false, true, true},
+		{"inconsistent-drain", true, true, true, false, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			now := time.Unix(100, 0).UTC()
@@ -1396,17 +1542,28 @@ func TestControllerRecoveryRetainsOnlyDrainedAuthority(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer database.Close()
-			runtime := &fakeRuntime{active: "blue", partialInventory: test.partial, inconsistent: test.inconsistent, observations: map[string]SlotObservation{
+			runtime := &fakeRuntime{active: "blue", partialInventory: test.partial, inconsistent: test.inconsistent, traffic: map[string]bool{"blue": !test.draining, "green": false}, observations: map[string]SlotObservation{
 				"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: false, Draining: test.draining},
-				"green": {Slot: "green", ProcessUp: true, ProcessReady: true, ControllerOwned: true},
+				"green": {Slot: "green", ProcessUp: true, ProcessReady: true, ControllerOwned: !test.partial},
 			}}
 			manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+			if test.liveLease {
+				lease, leaseErr := manager.newLease(context.Background(), "blue", 1)
+				if leaseErr != nil {
+					t.Fatal(leaseErr)
+				}
+				active := runtime.observations["blue"]
+				active.ControllerOwned = true
+				active.LeaseRenewalSupported = true
+				active.ControllerLease = &lease
+				runtime.observations["blue"] = active
+			}
 			err = manager.MaintainController(context.Background())
 			if (err == nil) != test.allowed {
 				t.Fatalf("maintenance err=%v; sequence=%v", err, runtime.sequence)
 			}
-			if runtime.traffic["blue"] || runtime.traffic["green"] {
-				t.Fatalf("recovery enabled traffic: %v", runtime.traffic)
+			if test.partial && runtime.traffic["blue"] != !test.draining {
+				t.Fatalf("inventory recovery changed active traffic: %v", runtime.traffic)
 			}
 			if runtime.observations["blue"].ControllerOwned != test.allowed || runtime.observations["green"].ControllerOwned {
 				t.Fatalf("unexpected ownership: %+v", runtime.observations)
@@ -1417,6 +1574,9 @@ func TestControllerRecoveryRetainsOnlyDrainedAuthority(t *testing.T) {
 			}
 			if !test.allowed {
 				return
+			}
+			if test.partial && containsSequence(runtime.sequence, "traffic-disable") {
+				t.Fatalf("inventory recovery disabled traffic: %v", runtime.sequence)
 			}
 			// Once reconciliation and the operator's drain exit are observed, ordinary
 			// readiness checks may restore traffic without changing active routing.
@@ -1496,10 +1656,20 @@ func TestMaintainControllerNegotiatesLegacyAndRenewalSlots(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer database.Close()
-			runtime := &fakeRuntime{active: "blue", legacyGrant: !renewal, partialInventory: true, observations: map[string]SlotObservation{
+			runtime := &fakeRuntime{active: "blue", legacyGrant: !renewal, partialInventory: renewal, traffic: map[string]bool{"blue": false, "green": false}, observations: map[string]SlotObservation{
 				"blue": {Slot: "blue", ProcessUp: true, ProcessReady: true, Draining: true, LeaseRenewalSupported: renewal},
 			}}
 			manager := NewManager(database, runtime, 15*time.Second, func() time.Time { return now })
+			if renewal {
+				lease, leaseErr := manager.newLease(context.Background(), "blue", 1)
+				if leaseErr != nil {
+					t.Fatal(leaseErr)
+				}
+				active := runtime.observations["blue"]
+				active.ControllerOwned = true
+				active.ControllerLease = &lease
+				runtime.observations["blue"] = active
+			}
 			for i := 0; i < 3; i++ {
 				if err := manager.MaintainController(context.Background()); err != nil {
 					t.Fatalf("round %d: %v", i, err)
@@ -1531,7 +1701,7 @@ func TestMaintainControllerRenewsLiveAuthorityDuringPartialInventory(t *testing.
 	if controllerrole.ProcessStartToken(os.Getpid()) == "" {
 		t.Skip("Linux process-incarnation evidence required")
 	}
-	for _, invalid := range []string{"", "expired", "foreign-owner", "old-incarnation", "legacy", "second-controller", "disable-failure", "grant-failure"} {
+	for _, invalid := range []string{"", "expired", "foreign-owner", "old-incarnation", "legacy", "second-controller", "grant-failure"} {
 		t.Run(invalid, func(t *testing.T) {
 			now := time.Unix(100, 0).UTC()
 			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
@@ -1539,7 +1709,7 @@ func TestMaintainControllerRenewsLiveAuthorityDuringPartialInventory(t *testing.
 				t.Fatal(err)
 			}
 			defer database.Close()
-			runtime := &fakeRuntime{active: "blue", partialInventory: true, observations: map[string]SlotObservation{
+			runtime := &fakeRuntime{active: "blue", partialInventory: true, traffic: map[string]bool{"blue": true, "green": false}, observations: map[string]SlotObservation{
 				"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: false, ControllerOwned: true, LeaseRenewalSupported: true, NativeWorkers: 1, PendingOperations: 1},
 				"green": {Slot: "green", ProcessUp: true, ProcessReady: true},
 			}}
@@ -1559,8 +1729,6 @@ func TestMaintainControllerRenewsLiveAuthorityDuringPartialInventory(t *testing.
 				value := runtime.observations["blue"]
 				value.LeaseRenewalSupported = false
 				runtime.observations["blue"] = value
-			case "disable-failure":
-				runtime.failDisableTraffic = true
 			case "grant-failure":
 				runtime.failGrant = true
 			case "second-controller":
@@ -1584,8 +1752,11 @@ func TestMaintainControllerRenewsLiveAuthorityDuringPartialInventory(t *testing.
 				t.Fatalf("normal in-flight partial inventory cancelled the controller: %v; sequence=%v", err, runtime.sequence)
 			}
 			for round := 0; round < 4; round++ {
-				if runtime.traffic["blue"] || runtime.traffic["green"] {
-					t.Fatal("partial inventory admitted traffic")
+				if !runtime.traffic["blue"] || runtime.traffic["green"] {
+					t.Fatal("partial inventory changed the active traffic role")
+				}
+				if containsSequence(runtime.sequence, "traffic-disable") {
+					t.Fatalf("partial inventory disabled traffic: %v", runtime.sequence)
 				}
 				current := *runtime.observations["blue"].ControllerLease
 				expected := original
@@ -1619,6 +1790,43 @@ func TestMaintainControllerRenewsLiveAuthorityDuringPartialInventory(t *testing.
 				t.Fatal("ordinary lifecycle was fenced")
 			}
 		})
+	}
+}
+
+func TestMaintainControllerPreservesTrafficWhenInventoryUnavailable(t *testing.T) {
+	if controllerrole.ProcessStartToken(os.Getpid()) == "" {
+		t.Skip("Linux process-incarnation evidence required")
+	}
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", inventoryUnavailable: true, traffic: map[string]bool{"blue": true, "green": false}, observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true, LeaseRenewalSupported: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true},
+	}}
+	manager := NewManager(database, runtime, 15*time.Second, func() time.Time { return now })
+	lease, err := manager.newLease(context.Background(), "blue", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := runtime.observations["blue"]
+	active.ControllerLease = &lease
+	runtime.observations["blue"] = active
+	if err := manager.MaintainController(context.Background()); err != nil {
+		t.Fatalf("inventory timeout interrupted the active service: %v; sequence=%v", err, runtime.sequence)
+	}
+	if !runtime.traffic["blue"] || runtime.traffic["green"] || containsSequence(runtime.sequence, "traffic-disable") || containsSequence(runtime.sequence, "fence") {
+		t.Fatalf("inventory timeout changed traffic or fenced roles: traffic=%v sequence=%v", runtime.traffic, runtime.sequence)
+	}
+	snapshot, err := runtime.Observe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.ControllerRecoveryOnly || validObservation(snapshot, now) {
+		t.Fatalf("inventory timeout classification = recovery_only:%t valid:%t", snapshot.ControllerRecoveryOnly, validObservation(snapshot, now))
 	}
 }
 

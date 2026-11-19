@@ -37,6 +37,7 @@ Drain 拒绝新的 lease 和 restart admission，允许在线 retrieval/release�
 八个客户端文件和依赖哈希 sidecar 必须作为一个可恢复 package 安装；更新受保护的连接材料时不得同步任何 consumer runtime home。
 每个槽位保持一个 Go 业务控制权威，并通过 deployd 只向一个槽位授予 scheduler/native-mutation role；不得发布或启动 legacy Bun authority。
 只有 deployd 报告新鲜的槽位健康状态、控制器主权、流量排空、startup reconciliation、expiry/GC 和 storage admission 证据后，才能退出 drain。
+`admin-status` 每页最多 8 路并发；任务取得并发槽位后拥有 2 秒探测预算，整页预算为 8 秒，排队不消耗任务预算。inventory timeout 或 partial 只表示清单观测不可用，阻止 stage、activate、切流和 rollback，不等于数据库或业务服务不可用，也不单独关闭 traffic 或 fencing；只有 rqlite 强读、服务健康、活动角色或 controller lease 等独立权威失败才触发全局 fence。
 
 控制面发布是运维者负责的人工 release operation，入口是目标服务器上的 `agent-vm-deploy update`，不是公共 `agent-vm` 生命周期 command。Agent 只通过已配置的 SSH alias 提交版本和 source revision；release 下载、目标架构选择、provenance/checksum 校验和 blue-green transaction 都在目标服务器上完成。不得从 Agent 工作站下载 release、使用 `scp`/`rsync` 上传 release bundle，或依据 Agent 工作站架构选择 native package。
 遵循[部署参考](references/deployment.md)和 [v1.8.0 发布合同](https://github.com/IvanLi-CN/agent-vm/blob/v1.8.0/docs/specs/agent-vm/contracts/release.md)中的 release manifest、兼容性、staging、drain、原子 activation、rollback 和权限规则；兼容 action 可以跨 release revision 继续使用并返回结构化 warning，不兼容 action 必须在产生 native effect 前失败。

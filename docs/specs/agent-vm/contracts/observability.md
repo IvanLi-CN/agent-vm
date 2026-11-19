@@ -110,7 +110,7 @@ Deployd SQLite 只保存最新观测快照，不保存每次轮询。它用于�
 
 Deployd 将 `admin-metrics` 和 `admin-status` 作为独立采样通道。缓慢或不可用的 `admin-status` 请求不得擦除有效容量指标；失败的清单观测必须移除或失效任务行，不能静默保留过期清单。容量采样失败必须独立报告，不能被新完成的清单采样掩盖。各来源的时间戳与健康诊断必须与汇总的 `agent_vm_up` 区分。
 
-`admin-status` 使用 keyset pagination，默认每页 25 条，最多 100 条；原生探测最多并发 8 个任务，每任务超时为 1 秒，每页超时为 5 秒，并输出 `partial`、`unknown`、`observation_consistent`、`probed`、`verified` 和 `timed_out`。未知或 `native_missing` 的任务仍未验证，不能显示为健康。全局 `agent_vm_task_states` 必须来自成功且一致的全量 `admin-metrics.task_states`，不能从分页清单推导；各已知状态在零任务时输出 `0`，容量观测失败时不能伪造零值。清单中的任务明细仍由清单采样负责。
+`admin-status` 使用 keyset pagination，默认每页 25 条，最多 100 条；原生探测最多并发 8 个任务，任务拿到并发槽位后每个拥有 2 秒预算，整页预算为 8 秒，排队时间不消耗任务预算，并输出 `partial`、`unknown`、`observation_consistent`、`probed`、`verified` 和 `timed_out`。未知或 `native_missing` 的任务仍未验证，不能显示为健康。全局 `agent_vm_task_states` 必须来自成功且一致的全量 `admin-metrics.task_states`，不能从分页清单推导；各已知状态在零任务时输出 `0`，容量观测失败时不能伪造零值。清单中的任务明细仍由清单采样负责。inventory timeout 或 partial 使部署观测不完整并阻止部署类操作，但不等于数据库或业务服务不可用；只要其他权威来源和现役 controller lease 健康，当前 traffic role 必须保持不变。
 
 Prometheus 只拉取 Deployd 的 `/metrics`，部署方通过 `job` 标识该唯一目标。槽位级序列必须带 `slot` 标签；部署级序列不能因为双槽位存活而重复。Grafana 只通过 Prometheus 查询，不读取 Deployd SQLite、槽位快照、Caddy 日志或 Unix socket。
 

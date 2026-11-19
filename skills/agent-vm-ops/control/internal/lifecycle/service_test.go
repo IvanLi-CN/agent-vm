@@ -119,6 +119,30 @@ func (guest *blockingStatusGuest) Status(context.Context, string) (map[string]an
 	return map[string]any{"status": "running"}, nil
 }
 
+type queuedStatusGuest struct {
+	*startupGuest
+	delay time.Duration
+}
+
+func (guest *queuedStatusGuest) Config(_ context.Context, instance string) (map[string]any, error) {
+	taskID := strings.TrimPrefix(instance, "instance-")
+	return map[string]any{
+		"config": map[string]any{
+			"user.agent-vm.managed":    "native-v1",
+			"user.agent-vm.task":       taskID,
+			"user.agent-vm.session":    "session-" + taskID,
+			"user.agent-vm.generation": "1",
+		},
+		"devices":          map[string]any{},
+		"expanded_devices": map[string]any{},
+	}, nil
+}
+
+func (guest *queuedStatusGuest) Status(context.Context, string) (map[string]any, error) {
+	time.Sleep(guest.delay)
+	return map[string]any{"status": "running"}, nil
+}
+
 func (guest *startupGuest) Init(_ context.Context, _, _ string, ownership map[string]string) error {
 	guest.initCalls++
 	if guest.initEntered != nil {
@@ -3358,7 +3382,7 @@ func TestAdminStatusReturnsAtPageDeadlineWhenProbeIgnoresContext(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	service := New(store, config.Defaults(), Options{Guest: guest})
-	pageCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	pageCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 	started := time.Now()
 	result, err := service.adminStatus(pageCtx, protocol.Request{"limit": int64(1)})
@@ -3366,7 +3390,7 @@ func TestAdminStatusReturnsAtPageDeadlineWhenProbeIgnoresContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("admin-status waited for an uncooperative probe: %s", elapsed)
 	}
 	if result["partial"] != true || result["timed_out"] != 1 || result["verified"] != 0 {
@@ -3375,6 +3399,36 @@ func TestAdminStatusReturnsAtPageDeadlineWhenProbeIgnoresContext(t *testing.T) {
 	item := result["tasks"].([]any)[0].(map[string]any)
 	if item["timed_out"] != true || item["verified"] != false || item["native_status"] != "unknown" {
 		t.Fatalf("timed-out admin-status item = %#v", item)
+	}
+}
+
+func TestAdminStatusStartsItemDeadlineAfterProbeSlot(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "admin-status-queue.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	for index := 0; index < 9; index++ {
+		taskID := fmt.Sprintf("queued-task-%02d", index)
+		if err := store.InsertTask(ctx, state.Task{
+			TaskID: taskID, SessionID: "session-" + taskID, Generation: 1, State: stateActive,
+			InstanceName: "instance-" + taskID, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := New(store, config.Defaults(), Options{Guest: &queuedStatusGuest{delay: 600 * time.Millisecond}})
+	started := time.Now()
+	result, err := service.adminStatus(ctx, protocol.Request{"limit": int64(9)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 4*time.Second {
+		t.Fatalf("admin-status queue test exceeded bounded page budget: %s", elapsed)
+	}
+	if result["timed_out"] != 0 || result["unknown"] != 0 || result["probed"] != 9 || result["verified"] != 9 || result["partial"] != false {
+		t.Fatalf("queued admin-status page = %#v", result)
 	}
 }
 

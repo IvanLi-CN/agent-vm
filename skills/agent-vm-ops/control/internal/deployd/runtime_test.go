@@ -131,6 +131,71 @@ func TestInventoryObservationConsistencyRejectsPartialSnapshots(t *testing.T) {
 	}
 }
 
+func TestInventoryOnlyControllerRecoveryRequiresIndependentAuthority(t *testing.T) {
+	now := time.Date(2026, time.November, 3, 0, 0, 0, 0, time.UTC)
+	sources := map[string]SourceObservation{}
+	for _, name := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
+		sources[name] = SourceObservation{Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)}
+	}
+	lease := &controllerrole.Lease{Slot: "blue", Term: 1, LeaseID: "lease-1", Nonce: "nonce-1", Generation: 1, Expiry: now.Add(time.Minute)}
+	base := RuntimeSnapshot{
+		ObservedAt: now, ActiveSlot: "blue", ControllerSlot: "blue", Consistent: false, Sources: sources,
+		Slots: map[string]SlotObservation{
+			"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, ControllerOwned: true, LeaseRenewalSupported: true, ControllerLease: lease, TrafficAccepting: true},
+			"green": {Slot: "green", ProcessUp: true, ProcessReady: true},
+		},
+	}
+	if !inventoryOnlyControllerRecovery(base, now) {
+		t.Fatal("inventory-only failure was not admitted for live authority recovery")
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(RuntimeSnapshot)
+	}{
+		{name: "native source unavailable", mutate: func(snapshot RuntimeSnapshot) {
+			source := snapshot.Sources["native_observation"]
+			source.Up = false
+			snapshot.Sources["native_observation"] = source
+		}},
+		{name: "second controller", mutate: func(snapshot RuntimeSnapshot) {
+			observation := snapshot.Slots["green"]
+			observation.ControllerOwned = true
+			snapshot.Slots["green"] = observation
+		}},
+		{name: "inactive traffic", mutate: func(snapshot RuntimeSnapshot) {
+			observation := snapshot.Slots["green"]
+			observation.TrafficAccepting = true
+			snapshot.Slots["green"] = observation
+		}},
+		{name: "lease missing", mutate: func(snapshot RuntimeSnapshot) {
+			observation := snapshot.Slots["blue"]
+			observation.ControllerLease = nil
+			snapshot.Slots["blue"] = observation
+		}},
+		{name: "inventory source missing", mutate: func(snapshot RuntimeSnapshot) {
+			delete(snapshot.Sources, "inventory_observation")
+		}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := base
+			snapshot.Sources = make(map[string]SourceObservation, len(base.Sources))
+			for name, source := range base.Sources {
+				snapshot.Sources[name] = source
+			}
+			snapshot.Slots = make(map[string]SlotObservation, len(base.Slots))
+			for slot, observation := range base.Slots {
+				snapshot.Slots[slot] = observation
+			}
+			test.mutate(snapshot)
+			if inventoryOnlyControllerRecovery(snapshot, now) {
+				t.Fatal("independent authority failure was classified as inventory-only recovery")
+			}
+		})
+	}
+}
+
 func TestValidObservedAtRejectsFutureTimestamp(t *testing.T) {
 	now := time.Date(2026, time.November, 3, 0, 0, 0, 0, time.UTC)
 	if _, ok := validObservedAt("2026-11-03T00:00:01Z", now); ok {
