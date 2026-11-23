@@ -342,7 +342,7 @@ func TestSourceGeneratedActionsLoadInGoConsumer(t *testing.T) {
 					t.Fatalf("historical=%t: %v", historical, err)
 				}
 				_, hasImageList := metadata.Actions["image-list"]
-				wantMaximum := int64(2)
+				wantMaximum := int64(3)
 				if historical {
 					wantMaximum = 1
 				}
