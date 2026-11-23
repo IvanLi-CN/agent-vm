@@ -1750,7 +1750,7 @@ func taskConditionMatches(ctx context.Context, tx *Tx, taskID string, condition 
 			return false, nil
 		}
 	}
-	if condition.LeaseActiveAfter != nil {
+	if condition.LeaseActiveAfter != nil && held == 0 {
 		if !lease.Valid {
 			return false, nil
 		}

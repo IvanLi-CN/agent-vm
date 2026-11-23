@@ -44,6 +44,19 @@ func TestValidateRequiresDeploymentIdentity(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsLegacyRenewalDefault(t *testing.T) {
+	value := validConfig()
+	value.RenewSeconds = 900
+	value.MaxLeaseSeconds = 7200
+	if err := value.Validate(); err != nil {
+		t.Fatalf("legacy renewal config = %v", err)
+	}
+	value.RenewSeconds = 899
+	if err := value.Validate(); err == nil || !strings.Contains(err.Error(), "renew_seconds") {
+		t.Fatalf("below-legacy renewal config = %v", err)
+	}
+}
+
 func TestDefaultsUseSafeDiskWatermarks(t *testing.T) {
 	value := Defaults()
 	if value.DiskLowBytes != 10*1024*1024*1024 || value.DiskTargetBytes != 20*1024*1024*1024 {

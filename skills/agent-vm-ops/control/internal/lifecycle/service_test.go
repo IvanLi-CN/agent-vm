@@ -493,6 +493,31 @@ func TestLeaseDurationBounds(t *testing.T) {
 	}
 }
 
+func TestLegacyRenewalDefaultUsesThirtyMinutes(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.ImageFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	cfg.RenewSeconds = 900
+	service := New(store, cfg, Options{Clock: func() time.Time { return now }})
+	ctx := context.Background()
+	if _, err := service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "legacy-renew", "generation": int64(0), "operation_id": "legacy-renew-acquire"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "renew", "session_id": "legacy-renew", "generation": int64(1), "operation_id": "legacy-renew-renew"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leaseDeadline(response["result"].(map[string]any)) != nowString(now.Add(3600*time.Second)) {
+		t.Fatalf("legacy renewal result = %#v", response)
+	}
+}
+
 func TestAcquirePersistsPhysicalReservationWhilePreparing(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

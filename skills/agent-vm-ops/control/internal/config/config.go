@@ -266,11 +266,11 @@ func (c Config) Validate() error {
 	if start > end {
 		return errors.New("config_invalid: vm_ip_start must not exceed vm_ip_end")
 	}
-	if c.InitialLeaseSeconds < 300 || c.MaxLeaseSeconds > 21600 || c.CacheSeconds <= 0 {
-		return errors.New("config_invalid: initial_lease_seconds must be at least 300 and max_lease_seconds at most 21600")
+	if c.InitialLeaseSeconds < 300 || c.MaxLeaseSeconds < 1800 || c.MaxLeaseSeconds > 21600 || c.CacheSeconds <= 0 {
+		return errors.New("config_invalid: initial_lease_seconds must be at least 300 and max_lease_seconds must be between 1800 and 21600")
 	}
-	if c.InitialLeaseSeconds > c.MaxLeaseSeconds || c.RenewSeconds < 1800 || c.RenewSeconds > c.MaxLeaseSeconds {
-		return errors.New("config_invalid: renew_seconds must be between 1800 and max_lease_seconds")
+	if c.InitialLeaseSeconds > c.MaxLeaseSeconds || c.RenewSeconds < 900 || c.RenewSeconds > c.MaxLeaseSeconds {
+		return errors.New("config_invalid: renew_seconds must be between 900 and max_lease_seconds")
 	}
 	if c.SweepSeconds <= 0 || c.WorkerTimeoutSeconds <= 0 || c.DrainTimeoutSeconds <= 0 || c.ActivationTimeoutSeconds <= 0 {
 		return errors.New("config_invalid: scheduler and timeout values must be positive")

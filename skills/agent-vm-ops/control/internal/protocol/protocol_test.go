@@ -151,6 +151,17 @@ func TestValidateRequestCountsPinReasonInUnicodeCharacters(t *testing.T) {
 	}
 }
 
+func TestValidateRequestAcceptsImageWithLeaseSemantics(t *testing.T) {
+	request := Request{
+		"protocol": Version, "action": "acquire", "session_id": "s", "generation": int64(0), "operation_id": "acquire-image-lease",
+		"image": "ubuntu-24.04", "lease_seconds": int64(300),
+		"compatibility": map[string]any{"request": map[string]any{"schema": 1, "semantic_revision": 3}},
+	}
+	if control := ValidateRequest(request); control != nil {
+		t.Fatalf("image plus lease request = %#v", control)
+	}
+}
+
 func testRelease() *ReleaseMetadata {
 	actions := make(map[string]ActionCompatibility, len(Actions))
 	for action := range Actions {

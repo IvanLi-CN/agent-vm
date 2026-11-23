@@ -466,8 +466,8 @@ func ValidateRequest(request Request) *Error {
 		compatibility, _ := request["compatibility"].(map[string]any)
 		declaration, _ := compatibility["request"].(map[string]any)
 		revision, valid := integer(declaration["semantic_revision"])
-		if !valid || revision != 2 {
-			return NewError("compatibility_invalid", "explicit image requires acquire semantic revision 2", nil)
+		if !valid || (revision != 2 && revision != 3) {
+			return NewError("compatibility_invalid", "explicit image requires acquire semantic revision 2 or 3", nil)
 		}
 	}
 	if session, exists := request["session_id"]; exists {

@@ -2821,7 +2821,11 @@ func (s *Service) renew(ctx context.Context, request protocol.Request) (map[stri
 	if err != nil {
 		return nil, protocol.NewError("state_unverified", "lease deadline is invalid", nil)
 	}
-	renewSeconds, err := leaseSecondsFor(request, s.Config.RenewSeconds, minimumRenewLeaseSeconds, s.Config.MaxLeaseSeconds)
+	renewDefault := s.Config.RenewSeconds
+	if renewDefault < minimumRenewLeaseSeconds {
+		renewDefault = minimumRenewLeaseSeconds
+	}
+	renewSeconds, err := leaseSecondsFor(request, renewDefault, minimumRenewLeaseSeconds, s.Config.MaxLeaseSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -4884,7 +4888,7 @@ func (s *Service) expire(ctx context.Context, request protocol.Request) (map[str
 		return map[string]any{"expired": false, "stale": true}, nil
 	}
 	now := s.Clock()
-	marked, err := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &generation, States: []string{stateActive, statePreparing}, LeaseExpiredAt: &now}, map[string]any{"state": stateClosing, "lease_expires_at": nil, "updated_at": nowString(now)})
+	marked, err := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &generation, States: []string{stateActive, statePreparing}, LeaseExpiredAt: &now, NoHold: true}, map[string]any{"state": stateClosing, "lease_expires_at": nil, "updated_at": nowString(now)})
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
