@@ -6,13 +6,13 @@ export const PROTOCOL = 4;
 export const VERSION = "dev";
 export const PRODUCT_FORMAT = 4;
 export const CLIENT_PRODUCT_FORMAT = 3;
-export const ACTIONS = ["acquire", "admin-gc", "admin-metrics", "admin-reconcile", "admin-reconcile-session", "admin-reconcile-history", "admin-session-list", "admin-status", "destroy", "doctor", "drain-enter", "drain-exit", "drain-status", "port-add", "port-list", "port-remove", "release", "renew", "resize", "restart", "ssh-info", "status", "image-list", "timer-age-gc", "timer-expire", "timer-reconcile"];
+export const ACTIONS = ["acquire", "admin-gc", "admin-metrics", "admin-reconcile", "admin-reconcile-session", "admin-reconcile-history", "admin-session-list", "admin-status", "destroy", "doctor", "drain-enter", "drain-exit", "drain-status", "port-add", "port-list", "port-remove", "release", "renew", "resize", "restart", "pin", "unpin", "ssh-info", "status", "image-list", "timer-age-gc", "timer-expire", "timer-reconcile"];
 // @agent-vm-build-identity: replaced only in staged release artifacts.
 export const BUILD_IDENTITY: { version: string; source_revision: string | null } = { version: "dev", source_revision: null };
 export function runtimeActions(): Record<string, Data> {
   return Object.fromEntries(ACTIONS.map(action => [action, {
     request: { schema: 1, semantic_revision: 1 }, response: { schema: 1, semantic_revision: 1 },
-    client_to_control: { schema_min: 1, schema_max: 1, semantic_min: 1, semantic_max: action === "acquire" ? 2 : 1 },
+    client_to_control: { schema_min: 1, schema_max: 1, semantic_min: 1, semantic_max: action === "acquire" ? 3 : action === "renew" ? 2 : 1 },
     control_to_client: { schema_min: 1, schema_max: 1, semantic_min: 1, semantic_max: 1 },
   }]));
 }

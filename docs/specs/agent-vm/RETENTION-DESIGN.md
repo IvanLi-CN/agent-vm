@@ -8,6 +8,8 @@ Releasing after every validation would turn build-cache reuse into a race with g
 
 An expected continuation is a reason to retain an effective lease, not an independent retention guarantee. An actively progressing Agent may explicitly renew for that use; execution interruption or returning control does not provide ongoing renewal. Expiry remains the fallback. The existing native lease and disposable stopped-cache semantics are unchanged.
 
+An explicit VM hold is a separate, auditable protection for the same continuation need when continuous renewal is impractical. It suppresses expiry and maintenance cleanup but does not make the lease permanent, does not protect a stopped cache from age-GC, and does not replace closure. The owner still releases or destroys the VM when the task ends; release requires clearing the hold first. A hold occupies the full CPU, memory and disk reservation, so capacity admission may fail rather than evict it. See [VM 保留与租约区间](../../adr/0056-agent-vm-vm-hold-and-lease-bands.md) for the decision and [agent-vm](../../../skills/agent-vm/SKILL.md#pin-and-unpin) for the operating procedure.
+
 ## Responsibility and evidence
 
 [agent-vm](../../../skills/agent-vm/SKILL.md#retain-and-renew) owns the retention, renewal and Finish procedure. The consuming engineering workflow invokes it at the relevant phase and closure points. This keeps one operating policy while preserving the consumer's independent review, CI and publication duties.

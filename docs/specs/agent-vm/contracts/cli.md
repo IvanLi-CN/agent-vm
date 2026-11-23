@@ -47,10 +47,12 @@ SSH 控制传输调用远端固定的 Go 请求适配器 `/opt/agent-vm-native/b
 | `version` | 输出本地协议与客户端版本，不连接控制主机 |
 | `doctor` | 查询组件健康状态与资源准入诊断 |
 | `status` | 查询所选会话的状态 |
-| `acquire [--cpu N] [--memory SIZE] [--disk SIZE] [--explain]` | 创建或复用所选会话的受管容器；启动失败时返回有界的只读诊断 |
-| `renew [--explain]` | 在配置上限内延长租约 |
+| `acquire [--cpu N] [--memory SIZE] [--disk SIZE] [--lease DURATION] [--explain]` | 创建或复用所选会话的受管容器；显式首租为 5 分钟–6 小时，省略时使用配置默认值；启动失败时返回有界的只读诊断 |
+| `renew [--lease DURATION] [--explain]` | 在配置上限内延长租约；显式增加量为 30 分钟–6 小时，结果封顶为当前时刻起 6 小时 |
 | `release [--explain]` | 撤销访问、停止来宾，并保留符合回收条件的缓存 |
 | `destroy [--explain]` / `restart [--explain]` | 执行明确请求的销毁或重启动作 |
+| `pin --reason TEXT [--explain]` | 保留 VM，阻止租约到期自动关机；理由必填 |
+| `unpin [--reason TEXT] [--explain]` | 取消保留并重新计算租约截止时间；跨 session 操作需人类批准 |
 | `resize [--cpu N] [--memory SIZE] [--disk SIZE] [--live] [--allow-restart] [--explain]` | 调整资源；在线调整和允许重启的调整使用不同选项 |
 | `ssh-info [--format json\|ssh-config]` | 获取并验证当前任务的连接材料 |
 | `ssh [-- SSH_ARGS]` | 使用生成的严格连接配置调用本机 SSH |
@@ -66,6 +68,8 @@ SSH 控制传输调用远端固定的 Go 请求适配器 `/opt/agent-vm-native/b
 | `admin session list` | 列出受管会话记录 |
 | `admin reconcile [--apply] [--explain]` / `admin gc [--apply] [--explain]` | 默认只预览；只有获授权的维护任务可以执行 `--apply` |
 | `admin reconcile-session --task-id ID --generation N --pending-operation-id ID [--apply] [--explain]` | 对指定任务、代次和单个未启动的 acquire 执行过期清理，保留缓存；默认只预览 |
+
+`DURATION` 使用分钟或小时后缀，例如 `30m`、`90m`、`6h`。`acquire` 显式首租为 5 分钟至 6 小时；`renew` 显式增加量为 30 分钟至 6 小时，且以当前截止时间为基准、按当前时刻起的配置上限封顶。
 
 会话变更命令失败时默认返回有界的状态诊断；`--explain` 才增加指标摘要和只读恢复预览。只有 `--apply` 允许恢复操作创建变更意图与本地操作日志。未知选项和不支持的命令格式必须拒绝，具体选项以当前客户端的 `--help` 为准。
 

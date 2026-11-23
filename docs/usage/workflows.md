@@ -5,7 +5,7 @@
 ## 获取、连接和同步
 
 1. 使用 `config list` 确认控制主机和项目绑定，使用 `doctor` 检查健康与准入。
-2. 使用 `acquire` 请求 CPU、内存和磁盘，记录返回的 session、task、generation、lease 和 operation 身份。
+2. 使用 `acquire` 请求 CPU、内存和磁盘；首租可用 `--lease 5m` 到 `6h` 显式指定，记录返回的 session、task、generation、lease 和 operation 身份。
 3. 使用 `status` 和 `ssh-info` 确认实例、租约、来宾可用性和 host key，再进入来宾。
 4. 使用 `sync` 同步工具拥有的源码目录，或使用 `upload`、`download`、`export` 处理明确的文件传输。
 5. 使用 `port add` 暴露已知服务，使用 `port list` 检查映射，结束后使用 `port remove` 清理不再需要的入口。
@@ -14,7 +14,7 @@
 
 ## 续租、调整和重启
 
-`renew` 在配置上限内延长租约；`resize` 调整 CPU、内存或磁盘，在线调整和允许重启的调整必须使用不同的选项；`restart` 只在明确知道中断影响时执行。变更前后都应查询 `status`，确认 generation 和 operation 结果。
+`renew` 在配置上限内延长租约，`--lease 30m` 到 `6h` 指定增加量；`resize` 调整 CPU、内存或磁盘，在线调整和允许重启的调整必须使用不同的选项；`restart` 只在明确知道中断影响时执行。需要跨长时间任务保留时使用 `pin --reason`，`unpin` 后按首租默认时长重算截止时间；保留期间 `renew` 和 `release` 会被拒绝。变更前后都应查询 `status`，确认 generation、lease_state 和 operation 结果。
 
 ```sh
 agent-vm --session-id <session> renew --explain

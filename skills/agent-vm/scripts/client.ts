@@ -389,7 +389,9 @@ export class Client {
     assertInstallationReady(this.sidecar);
     const metadata = runtimeRelease(), warnings: Data[] = [];
     request.compatibility = capability(action, metadata);
-    if (action === "acquire" && fields.image !== undefined) request.compatibility.request = { schema: 1, semantic_revision: 2 };
+    if (action === "acquire" && fields.lease_seconds !== undefined) request.compatibility.request = { schema: 1, semantic_revision: 3 };
+    else if (action === "renew" && fields.lease_seconds !== undefined) request.compatibility.request = { schema: 1, semantic_revision: 2 };
+    else if (action === "acquire" && fields.image !== undefined) request.compatibility.request = { schema: 1, semantic_revision: 2 };
     const selectedTransport = this.env.AGENT_VM_TRANSPORT ?? metadata.transport;
     if (selectedTransport !== "https" && selectedTransport !== "go-request" && selectedTransport !== "ssh") fail("release_metadata_invalid", "release metadata must select go-request or https transport");
     const https = selectedTransport === "https" ? httpsConfig(this.env) : undefined;

@@ -52,7 +52,7 @@ class ManifestContractTests(unittest.TestCase):
         self.assertEqual(checked["format"], 1)
         self.assertEqual(checked["release_id"], "a" * 40)
         self.assertEqual(checked["protocol"], 4)
-        self.assertEqual(set(checked["actions"]), set(MANIFEST.ACTION_NAMES))
+        self.assertEqual(set(checked["actions"]), set(MANIFEST.LEGACY_ACTION_NAMES))
         self.assertEqual(MANIFEST.verify_bundle(self.root)["source_revision"], "a" * 40)
 
     def test_fixed_artifact_set_contains_the_complete_bun_controller_and_client(self):

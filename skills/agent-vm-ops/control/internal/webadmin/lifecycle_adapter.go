@@ -28,11 +28,11 @@ func (actions *LifecycleActions) ValidateVMAction(ctx context.Context, task stat
 	return actions.Service.ValidateManagementVMAction(ctx, task, action, parameters)
 }
 
-func (actions *LifecycleActions) ExecuteVMAction(ctx context.Context, operationID, action, taskID string, generation int64, parameters map[string]any) (map[string]any, error) {
-	return actions.ExecuteVMActionWithVersion(ctx, operationID, action, taskID, generation, "", parameters)
+func (actions *LifecycleActions) ExecuteVMAction(ctx context.Context, operationID, action, taskID string, generation int64, reason string, parameters map[string]any) (map[string]any, error) {
+	return actions.ExecuteVMActionWithVersion(ctx, operationID, action, taskID, generation, "", reason, parameters)
 }
 
-func (actions *LifecycleActions) ExecuteVMActionWithVersion(ctx context.Context, operationID, action, taskID string, generation int64, targetVersion string, parameters map[string]any) (map[string]any, error) {
+func (actions *LifecycleActions) ExecuteVMActionWithVersion(ctx context.Context, operationID, action, taskID string, generation int64, targetVersion, reason string, parameters map[string]any) (map[string]any, error) {
 	if actions == nil || actions.Service == nil || actions.Store == nil {
 		return nil, errors.New("authority_unavailable: lifecycle service is not configured")
 	}
@@ -56,6 +56,9 @@ func (actions *LifecycleActions) ExecuteVMActionWithVersion(ctx context.Context,
 	}
 	if targetVersion != "" {
 		request["management_target_version"] = targetVersion
+	}
+	if reason != "" {
+		request["reason"] = reason
 	}
 	for key, value := range parameters {
 		request[key] = value

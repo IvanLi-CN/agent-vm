@@ -269,6 +269,10 @@ func openRemote(dsn string, allowCreate bool) (*Store, error) {
 		_ = store.Close()
 		return nil, err
 	}
+	if err := store.EnsureTaskHoldSchema(context.Background()); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 	return store, nil
 }
 
@@ -425,6 +429,11 @@ func requireCanonicalCoreSchema(ctx context.Context, objects []remoteSchemaObjec
 	for key, expected := range canonical {
 		object, exists := actual[key]
 		if !exists {
+			// task_holds is an additive core object. Older authorities open so
+			// the normalized open path can create it without a tasks rewrite.
+			if key == objectKey("table", "task_holds") {
+				continue
+			}
 			return fmt.Errorf("database schema missing canonical object %s", key)
 		}
 		if normalizeSchemaSQL(object.SQL) != normalizeSchemaSQL(expected.SQL) {
@@ -715,6 +724,7 @@ func (r *remoteBackend) ensureManagementSchema(ctx context.Context) error {
 		{name: "oidc-return-path", version: 1},
 		{name: "principal-identity", version: 1},
 		{name: "token-revocation", version: 1},
+		{name: "vm-hold", version: 1},
 	} {
 		statements = append(statements, remoteStatement{
 			query: "INSERT OR IGNORE INTO state_capabilities(name, version, created_at) VALUES(?, ?, ?)",
@@ -740,6 +750,25 @@ func (r *remoteBackend) ensureManagementSchema(ctx context.Context) error {
 	}
 	if err := r.syncLocked(ctx); err != nil {
 		return &TransactionError{Phase: "verify", SQLOperation: "rqlite_management_schema", StateCommitted: nil, Cause: err}
+	}
+	return nil
+}
+
+// ensureTaskHoldSchema adds the additive hold table to an existing remote
+// authority without rewriting the canonical tasks table. It is a schema
+// repair, not a business mutation, so it does not advance the state epoch.
+func (r *remoteBackend) ensureTaskHoldSchema(ctx context.Context) error {
+	if err := r.mu.LockContext(ctx); err != nil {
+		return err
+	}
+	defer r.mu.Unlock()
+	statements := make([]remoteStatement, 0, 2)
+	for _, statement := range splitSQLStatements(taskHoldSchema) {
+		statements = append(statements, remoteStatement{query: statement})
+	}
+	r.invalidateSync()
+	if _, err := r.request(ctx, statements, true); err != nil {
+		return err
 	}
 	return nil
 }

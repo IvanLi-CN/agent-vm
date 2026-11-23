@@ -588,7 +588,9 @@ func (authority *Authority) vmValue(ctx context.Context, task *state.Task) (map[
 		imageLabel = image.VersionLabel
 	}
 	leaseState := "unknown"
-	if task.LeaseExpiresAt == nil {
+	if task.PinnedAt != nil {
+		leaseState = "pinned"
+	} else if task.LeaseExpiresAt == nil {
 		leaseState = "absent"
 	} else if parsed, parseErr := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt); parseErr == nil {
 		leaseState = "expired"
@@ -601,7 +603,10 @@ func (authority *Authority) vmValue(ctx context.Context, task *state.Task) (map[
 	}
 	allowed := []string{}
 	if task.State == "active" {
-		allowed = []string{"restart", "resize", "release", "destroy", "port_add"}
+		allowed = []string{"restart", "resize", "release", "destroy", "port_add", "pin"}
+		if task.PinnedAt != nil {
+			allowed = []string{"restart", "resize", "destroy", "port_add", "unpin"}
+		}
 		for _, port := range ports {
 			if port.PortName != "ssh" {
 				allowed = append(allowed, "port_remove")
@@ -619,6 +624,14 @@ func (authority *Authority) vmValue(ctx context.Context, task *state.Task) (map[
 	for _, port := range ports {
 		portValues = append(portValues, map[string]any{"name": port.PortName, "protocol": port.Protocol, "host_port": port.HostPort, "guest_port": port.VMPort})
 	}
+	var pinned any
+	if task.PinnedAt != nil {
+		reason := ""
+		if task.PinReason != nil {
+			reason = *task.PinReason
+		}
+		pinned = map[string]any{"pinned_at": *task.PinnedAt, "reason": reason}
+	}
 	return map[string]any{
 		"task_id": task.TaskID, "session_id": task.SessionID, "generation": strconv.FormatInt(task.Generation, 10),
 		"resource_version": "vm:" + task.TaskID + ":" + task.UpdatedAt, "state": task.State,
@@ -626,6 +639,7 @@ func (authority *Authority) vmValue(ctx context.Context, task *state.Task) (map[
 		"image":         map[string]any{"fingerprint": task.ImageFingerprint, "version_label": imageLabel},
 		"resources":     map[string]any{"cpu_vcpu": numberOrNil(resources["cpu"]), "memory_bytes": decimalBytes(resources["memory_mib"], 1024*1024), "disk_bytes": decimalBytes(resources["disk_gib"], 1024*1024*1024)},
 		"lease":         map[string]any{"state": leaseState, "expires_at": task.LeaseExpiresAt},
+		"pinned":        pinned,
 		"port_mappings": portValues, "last_error": lastError, "updated_at": task.UpdatedAt, "allowed_actions": allowed,
 	}, nil
 }
@@ -899,6 +913,10 @@ func (authority *Authority) submitVMAction(writer http.ResponseWriter, request *
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
 	}
+	if payload.Action == "pin" && strings.TrimSpace(payload.Reason) == "" {
+		writeProblem(writer, invalidRequest("pin requires a non-empty reason"))
+		return
+	}
 	if err := validateConfirmationToken(payload.ConfirmationToken); err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
@@ -966,19 +984,39 @@ func (authority *Authority) validateVMTarget(ctx context.Context, taskID, action
 	if targetVersion != "vm:"+task.TaskID+":"+task.UpdatedAt {
 		return nil, errors.New("stale_target: VM resource version changed")
 	}
-	if action == "" || !containsString([]string{"restart", "resize", "release", "destroy", "port_add", "port_remove"}, action) {
+	if action == "" || !containsString([]string{"restart", "resize", "release", "destroy", "port_add", "port_remove", "pin", "unpin"}, action) {
 		return nil, errors.New("unsupported_action: VM action is not allowed")
 	}
-	if action != "release" && action != "destroy" {
+	if action == "pin" {
 		if task.State != "active" {
 			return nil, errors.New("stale_target: VM is not active")
 		}
-		if task.LeaseExpiresAt == nil {
-			return nil, errors.New("lease_expired: VM lease is not active")
+		if task.PinnedAt != nil {
+			return nil, errors.New("already_pinned: VM is already pinned")
 		}
-		lease, parseErr := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt)
-		if parseErr != nil || !lease.After(authority.Clock().UTC()) {
-			return nil, errors.New("lease_expired: VM lease has expired")
+	} else if action == "unpin" {
+		if task.State != "active" {
+			return nil, errors.New("stale_target: VM is not active")
+		}
+		if task.PinnedAt == nil {
+			return nil, errors.New("not_pinned: VM is not pinned")
+		}
+	} else if action == "release" {
+		if task.PinnedAt != nil {
+			return nil, errors.New("lease_pinned: unpin the VM before releasing it")
+		}
+	} else if action != "destroy" {
+		if task.State != "active" {
+			return nil, errors.New("stale_target: VM is not active")
+		}
+		if task.PinnedAt == nil {
+			if task.LeaseExpiresAt == nil {
+				return nil, errors.New("lease_expired: VM lease is not active")
+			}
+			lease, parseErr := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt)
+			if parseErr != nil || !lease.After(authority.Clock().UTC()) {
+				return nil, errors.New("lease_expired: VM lease has expired")
+			}
 		}
 	}
 	if guard, ok := authority.Management.Options.Actions.(management.VMActionGuard); ok {
@@ -1845,7 +1883,7 @@ func normalizeVMParameters(action string, parameters map[string]any) (map[string
 	}
 	allowed := map[string]struct{}{}
 	switch action {
-	case "restart", "release", "destroy":
+	case "restart", "release", "destroy", "pin", "unpin":
 	case "resize":
 		allowed = map[string]struct{}{"cpu_vcpu": {}, "memory_bytes": {}, "disk_bytes": {}, "live": {}, "allow_restart": {}}
 	case "port_add":
@@ -2141,7 +2179,7 @@ func validateVMQuery(query url.Values) error {
 			return errors.New("state is invalid")
 		}
 	}
-	if value := query.Get("lease_state"); value != "" && !containsString([]string{"effective", "expired", "absent", "unknown"}, value) {
+	if value := query.Get("lease_state"); value != "" && !containsString([]string{"effective", "expired", "absent", "unknown", "pinned"}, value) {
 		return errors.New("lease_state is invalid")
 	}
 	return nil
@@ -2397,7 +2435,15 @@ func vmImpact(task *state.Task, action string) map[string]any {
 	if task != nil && task.TaskID != "" {
 		count = 1
 	}
-	return map[string]any{"summary_code": action, "affected_session_count": count, "affected_image_references": emptyReferences(), "changes": []any{map[string]any{"code": action, "count": count, "value": nil}}}
+	changes := []any{map[string]any{"code": action, "count": count, "value": nil}}
+	if action == "destroy" && task != nil && task.PinnedAt != nil {
+		reason := ""
+		if task.PinReason != nil {
+			reason = *task.PinReason
+		}
+		changes = append(changes, map[string]any{"code": "pinned_vm_destroyed", "count": count, "value": reason})
+	}
+	return map[string]any{"summary_code": action, "affected_session_count": count, "affected_image_references": emptyReferences(), "changes": changes}
 }
 
 func imageImpact(image state.ManagedImage, action string) map[string]any {

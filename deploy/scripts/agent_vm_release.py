@@ -53,8 +53,8 @@ try:
         HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256,
         ManifestError,
         build_manifest,
-        default_operations,
         legacy_manifest,
+        legacy_operations,
         load_manifest,
         sha256_file,
         verify_client_sidecar,
@@ -90,8 +90,8 @@ except ModuleNotFoundError:
         HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256,
         ManifestError,
         build_manifest,
-        default_operations,
         legacy_manifest,
+        legacy_operations,
         load_manifest,
         sha256_file,
         verify_client_sidecar,
@@ -271,7 +271,7 @@ def build_release(source_root: Path, output: Path, source_revision: str | None =
             artifact = _artifact_entry(root, destination_name, role, mode)
             artifact["name"] = "unit:" + Path(destination_name).name if role == "unit" else artifact["name"]
             artifacts.append(artifact)
-        manifest = build_manifest(revision, artifacts, operations=default_operations())
+        manifest = build_manifest(revision, artifacts, operations=legacy_operations())
         _write_json(root / MANIFEST_NAME, manifest)
         client_artifact = next(item for item in artifacts if item["role"] == "client")
         _write_json(root / CLIENT_SIDECAR_NAME, {

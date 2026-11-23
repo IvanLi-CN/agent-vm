@@ -422,6 +422,9 @@ func maintenanceExpiryCandidate(task *state.Task, now time.Time) bool {
 	if task.State != stateActive && task.State != statePreparing {
 		return false
 	}
+	if task.PinnedAt != nil {
+		return false
+	}
 	if task.LeaseExpiresAt == nil {
 		return true
 	}

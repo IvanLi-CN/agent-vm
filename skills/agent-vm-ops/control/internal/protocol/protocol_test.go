@@ -140,6 +140,28 @@ func TestValidateRequestRejectsMalformedOperationID(t *testing.T) {
 	}
 }
 
+func TestValidateRequestCountsPinReasonInUnicodeCharacters(t *testing.T) {
+	valid := Request{"protocol": Version, "action": "pin", "session_id": "s", "generation": int64(1), "operation_id": "pin-valid", "reason": strings.Repeat("心", 512)}
+	if control := ValidateRequest(valid); control != nil {
+		t.Fatalf("512-character pin reason = %#v", control)
+	}
+	invalid := Request{"protocol": Version, "action": "pin", "session_id": "s", "generation": int64(1), "operation_id": "pin-invalid", "reason": strings.Repeat("心", 513)}
+	if control := ValidateRequest(invalid); control == nil || control.Code != "invalid_request" {
+		t.Fatalf("513-character pin reason = %#v", control)
+	}
+}
+
+func TestValidateRequestAcceptsImageWithLeaseSemantics(t *testing.T) {
+	request := Request{
+		"protocol": Version, "action": "acquire", "session_id": "s", "generation": int64(0), "operation_id": "acquire-image-lease",
+		"image": "ubuntu-24.04", "lease_seconds": int64(300),
+		"compatibility": map[string]any{"request": map[string]any{"schema": 1, "semantic_revision": 3}},
+	}
+	if control := ValidateRequest(request); control != nil {
+		t.Fatalf("image plus lease request = %#v", control)
+	}
+}
+
 func testRelease() *ReleaseMetadata {
 	actions := make(map[string]ActionCompatibility, len(Actions))
 	for action := range Actions {

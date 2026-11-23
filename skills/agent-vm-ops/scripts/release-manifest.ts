@@ -53,6 +53,16 @@ export const ACTION_NAMES: readonly string[] = Object.freeze([...RUNTIME_ACTIONS
 // Format 1 is a frozen compatibility bridge, without image-selection semantics.
 export const LEGACY_ACTION_NAMES = ACTION_NAMES.filter(action => action !== "image-list");
 const ACTION_SET: ReadonlySet<string> = new Set(LEGACY_ACTION_NAMES);
+const LEGACY_ACTION_VARIANTS = [
+  LEGACY_ACTION_NAMES,
+  LEGACY_ACTION_NAMES.filter(action => action !== "pin" && action !== "unpin"),
+];
+const ACTION_VARIANTS = [
+  ACTION_NAMES,
+  LEGACY_ACTION_NAMES,
+  ACTION_NAMES.filter(action => action !== "pin" && action !== "unpin"),
+  LEGACY_ACTION_NAMES.filter(action => action !== "pin" && action !== "unpin"),
+];
 
 const HTTPS_TRANSPORT_UNAVAILABLE =
   "https transport is validation-only until bundled client HTTPS support is integrated";
@@ -273,6 +283,7 @@ function _same_keys(value: Mapping, expected: readonly string[]): boolean {
     expected.every((key) => Object.hasOwn(value, key))
   );
 }
+
 
 function _posix_parts(path: string): string[] {
   // PurePosixPath removes repeated separators and "." components.
@@ -646,7 +657,7 @@ export function validate_manifest(value: unknown): ReleaseManifest {
       { actions: unsupported_actions },
     );
   }
-  if (!_same_keys(raw_actions, LEGACY_ACTION_NAMES)) {
+  if (!LEGACY_ACTION_VARIANTS.some((variant) => _same_keys(raw_actions, variant))) {
     throw _error(
       "manifest_action_set_invalid",
       "manifest action set differs from the fixed control surface",
@@ -1403,6 +1414,7 @@ export const STATE_CAPABILITY_MARKERS = Object.freeze([
   "principal-identity@1",
   "session-image-binding@1",
   "token-revocation@1",
+  "vm-hold@1",
 ]);
 
 const PRODUCT_CLIENT_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
@@ -1546,7 +1558,7 @@ function _product_artifacts(value: unknown, target: ProductTarget, format: 3 | 4
 
 function _product_actions(value: unknown): Record<string, OperationSpec> {
   const raw = _require_mapping(value, "actions");
-  if (!_same_keys(raw, ACTION_NAMES) && !_same_keys(raw, LEGACY_ACTION_NAMES)) throw _product_error("manifest_action_set_invalid", "product action set differs from protocol 4");
+  if (!ACTION_VARIANTS.some((variant) => _same_keys(raw, variant))) throw _product_error("manifest_action_set_invalid", "product action set differs from protocol 4");
   const actions: Record<string, OperationSpec> = {};
   for (const action of Object.keys(raw)) {
     const spec = _require_mapping(raw[action], `actions.${action}`);

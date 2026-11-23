@@ -36,7 +36,7 @@ var Actions = map[string]struct{}{
 	"admin-session-list": {}, "admin-status": {}, "destroy": {}, "doctor": {},
 	"drain-enter": {}, "drain-exit": {}, "drain-status": {}, "port-add": {},
 	"port-list": {}, "port-remove": {}, "release": {}, "renew": {}, "resize": {},
-	"restart": {}, "ssh-info": {}, "status": {}, "image-list": {}, "timer-age-gc": {},
+	"restart": {}, "ssh-info": {}, "status": {}, "image-list": {}, "pin": {}, "unpin": {}, "timer-age-gc": {},
 	"timer-expire": {}, "timer-reconcile": {},
 }
 
@@ -466,8 +466,8 @@ func ValidateRequest(request Request) *Error {
 		compatibility, _ := request["compatibility"].(map[string]any)
 		declaration, _ := compatibility["request"].(map[string]any)
 		revision, valid := integer(declaration["semantic_revision"])
-		if !valid || revision != 2 {
-			return NewError("compatibility_invalid", "explicit image requires acquire semantic revision 2", nil)
+		if !valid || (revision != 2 && revision != 3) {
+			return NewError("compatibility_invalid", "explicit image requires acquire semantic revision 2 or 3", nil)
 		}
 	}
 	if session, exists := request["session_id"]; exists {
@@ -484,6 +484,20 @@ func ValidateRequest(request Request) *Error {
 		if value, ok := integer(request["generation"]); !ok || value < 0 {
 			return NewError("invalid_request", "generation must be a non-negative integer", nil)
 		}
+	}
+	if raw, exists := request["lease_seconds"]; exists {
+		value, ok := integer(raw)
+		if !ok || value <= 0 || (action != "acquire" && action != "renew") {
+			return NewError("invalid_request", "lease_seconds is only valid as a positive acquire or renew duration", nil)
+		}
+	}
+	if raw, exists := request["reason"]; exists {
+		value, ok := raw.(string)
+		if !ok || !utf8.ValidString(value) || utf8.RuneCountInString(value) > 512 || strings.TrimSpace(value) == "" || (action != "pin" && action != "unpin") {
+			return NewError("invalid_request", "reason is only valid as a non-empty pin or unpin note of at most 512 characters", nil)
+		}
+	} else if action == "pin" {
+		return NewError("invalid_request", "pin requires a non-empty reason", nil)
 	}
 	if action == "admin-reconcile-session" {
 		generation, valid := integer(request["generation"])

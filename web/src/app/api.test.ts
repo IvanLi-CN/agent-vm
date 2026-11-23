@@ -103,6 +103,23 @@ describe("mock image uploads", () => {
     expect(mockState.overview.capacity.logical_memory_remaining.value_bytes).toBe((activeMemory + BigInt(activeVm.resources.memory_bytes!)).toString());
   });
 
+  it("requires a pin reason and refuses release until unpin", async () => {
+    const vm = mockState.vms[0];
+    const preview = await previewVMAction(vm.task_id, "pin", vm);
+    await expect(submitVMAction(vm.task_id, "pin", "", preview, vm.generation, {}, "synthetic-pin-no-reason")).rejects.toMatchObject({ code: "invalid_request" });
+    const pinned = await submitVMAction(vm.task_id, "pin", "hold for owner review", preview, vm.generation, {}, "synthetic-pin");
+    expect(pinned.status).toBe("succeeded");
+    expect(vm.pinned?.reason).toBe("hold for owner review");
+    expect(vm.lease.state).toBe("pinned");
+    expect(vm.allowed_actions).toContain("unpin");
+    await expect(previewVMAction(vm.task_id, "release", vm)).rejects.toMatchObject({ code: "lease_pinned" });
+    const unpinPreview = await previewVMAction(vm.task_id, "unpin", vm);
+    const unpinned = await submitVMAction(vm.task_id, "unpin", "owner reviewed", unpinPreview, vm.generation, {}, "synthetic-unpin");
+    expect(unpinned.status).toBe("succeeded");
+    expect(vm.pinned).toBeNull();
+    expect(vm.lease.state).toBe("effective");
+  });
+
   it("keeps default image references and selection version aligned", async () => {
     const previousDefault = mockState.images.find((image) => image.is_default)!;
     const nextDefault = mockState.images.find((image) => !image.is_default)!;

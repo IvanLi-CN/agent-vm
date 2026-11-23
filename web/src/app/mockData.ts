@@ -45,15 +45,16 @@ const baseVM = {
   image: { fingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", version_label: "2026.01" },
   resources: { cpu_vcpu: 4, memory_bytes: "8589934592", disk_bytes: "53687091200" },
   lease: { state: "effective" as const, expires_at: "2026-01-15T11:20:00Z" },
+  pinned: null as ManagedVM["pinned"],
   port_mappings: [{ name: "preview", protocol: "tcp" as const, host_port: 24001, guest_port: 3000 }],
   last_error: null,
   updated_at: "2026-01-15T10:19:00Z",
-  allowed_actions: ["restart", "resize", "release", "destroy", "port_add", "port_remove"] as ManagedVM["allowed_actions"],
+  allowed_actions: ["restart", "resize", "release", "destroy", "pin", "port_add", "port_remove"] as ManagedVM["allowed_actions"],
 };
 
 export const vms: ManagedVM[] = [
   { ...baseVM, task_id: "task_example_01" },
-  { ...baseVM, task_id: "task_aurora_02", session_id: "session_aurora_02", generation: "18", resource_version: "vm:task_aurora_02:revision-4", state: "active", image: { fingerprint: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", version_label: "legacy-default" }, resources: { cpu_vcpu: 2, memory_bytes: "4294967296", disk_bytes: "32212254720" }, lease: { state: "effective", expires_at: "2026-01-15T10:44:00Z" }, port_mappings: [{ name: "preview", protocol: "tcp", host_port: 24002, guest_port: 3000 }] },
+  { ...baseVM, task_id: "task_aurora_02", session_id: "session_aurora_02", generation: "18", resource_version: "vm:task_aurora_02:revision-4", state: "active", image: { fingerprint: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", version_label: "legacy-default" }, resources: { cpu_vcpu: 2, memory_bytes: "4294967296", disk_bytes: "32212254720" }, lease: { state: "pinned", expires_at: "2026-01-15T10:44:00Z" }, pinned: { pinned_at: "2026-01-15T10:20:00Z", reason: "Awaiting owner review of the migration result" }, allowed_actions: ["restart", "resize", "destroy", "port_add", "port_remove", "unpin"], port_mappings: [{ name: "preview", protocol: "tcp", host_port: 24002, guest_port: 3000 }] },
   { ...baseVM, task_id: "task_cedar_03", session_id: "session_cedar_03", generation: "7", resource_version: "vm:task_cedar_03:revision-12", state: "cached", native_state: "stopped", guest_availability: "unavailable", lease: { state: "absent", expires_at: null }, resources: { cpu_vcpu: 1, memory_bytes: "2147483648", disk_bytes: "21474836480" }, port_mappings: [], allowed_actions: ["release", "destroy"] },
   { ...baseVM, task_id: "task_delta_04", session_id: "session_delta_04", generation: "33", resource_version: "vm:task_delta_04:revision-8", state: "failed", native_state: "unknown", guest_availability: "unknown", lease: { state: "expired", expires_at: "2026-01-14T22:10:00Z" }, last_error: { code: "authority_unavailable", phase: "native_action", retryable: true }, port_mappings: [], allowed_actions: ["release", "destroy"] },
   { ...baseVM, task_id: "task_echo_05", session_id: "session_echo_05", generation: "11", resource_version: "vm:task_echo_05:revision-3", state: "preparing", native_state: "transitional", guest_availability: "unavailable", image: { fingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", version_label: "2026.01" }, lease: { state: "unknown", expires_at: null }, resources: { cpu_vcpu: 2, memory_bytes: "4294967296", disk_bytes: "21474836480" }, port_mappings: [], allowed_actions: ["release", "destroy"] },
@@ -83,7 +84,7 @@ export const audits: AuditEvent[] = [
 export const system: SystemStatus = {
   product_version: "0.0.0+synthetic",
   resource_version: "system:revision-4",
-  state_capabilities: ["legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "oidc-return-path@1", "principal-identity@1", "session-image-binding@1", "token-revocation@1"],
+  state_capabilities: ["legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "oidc-return-path@1", "principal-identity@1", "session-image-binding@1", "token-revocation@1", "vm-hold@1"],
   maintenance: { draining: false, reconciliation_pending: 0, garbage_collection_pending: 0 },
   components: [
     { name: "web", state: "ready", version: "0.0.0+synthetic", observed_at: "2026-01-15T10:20:30Z" },

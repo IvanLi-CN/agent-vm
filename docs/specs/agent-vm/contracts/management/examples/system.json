@@ -8,7 +8,8 @@
     "oidc-return-path@1",
     "principal-identity@1",
     "session-image-binding@1",
-    "token-revocation@1"
+    "token-revocation@1",
+    "vm-hold@1"
   ],
   "maintenance": {
     "draining": false,

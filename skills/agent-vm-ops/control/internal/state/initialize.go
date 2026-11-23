@@ -70,5 +70,9 @@ func ResumeFreshRQLite(ctx context.Context, dsn string) (*Store, error) {
 		s.Close()
 		return nil, err
 	}
+	if err := s.EnsureTaskHoldSchema(ctx); err != nil {
+		s.Close()
+		return nil, err
+	}
 	return s, nil
 }

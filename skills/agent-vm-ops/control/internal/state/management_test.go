@@ -26,6 +26,10 @@ func TestManagementMigrationIsAdditiveAndSeedsLegacyDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
+	var holdTable int
+	if err := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'task_holds'").Scan(&holdTable); err != nil || holdTable != 1 {
+		t.Fatalf("task_holds migration = %d, err = %v", holdTable, err)
+	}
 	fingerprint := strings.Repeat("a", 64)
 	if err := store.SeedLegacyImage(context.Background(), fingerprint); err != nil {
 		t.Fatal(err)
@@ -34,7 +38,7 @@ func TestManagementMigrationIsAdditiveAndSeedsLegacyDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(capabilities) != 7 {
+	if len(capabilities) != 8 {
 		t.Fatalf("capabilities = %#v", capabilities)
 	}
 	image, err := store.GetManagedImage(context.Background(), fingerprint)

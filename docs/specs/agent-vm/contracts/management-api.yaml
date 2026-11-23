@@ -355,7 +355,7 @@ paths:
           in: query
           schema:
             type: string
-            enum: [effective, expired, absent, unknown]
+            enum: [effective, expired, absent, unknown, pinned]
         - $ref: "#/components/parameters/Query"
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Cursor"
@@ -1507,7 +1507,7 @@ components:
     ManagedVM:
       type: object
       additionalProperties: false
-      required: [task_id, session_id, generation, resource_version, state, native_state, guest_availability, image, resources, lease, port_mappings, updated_at]
+      required: [task_id, session_id, generation, resource_version, state, native_state, guest_availability, image, resources, lease, pinned, port_mappings, updated_at]
       properties:
         task_id:
           type: string
@@ -1558,10 +1558,14 @@ components:
           properties:
             state:
               type: string
-              enum: [effective, expired, absent, unknown]
+              enum: [effective, expired, absent, unknown, pinned]
             expires_at:
               type: [string, "null"]
               format: date-time
+        pinned:
+          oneOf:
+            - $ref: "#/components/schemas/VMPin"
+            - type: "null"
         port_mappings:
           type: array
           items:
@@ -1585,7 +1589,19 @@ components:
           uniqueItems: true
           items:
             type: string
-            enum: [image_name, restart, resize, release, destroy, port_add, port_remove]
+            enum: [image_name, restart, resize, release, destroy, pin, unpin, port_add, port_remove]
+    VMPin:
+      type: object
+      additionalProperties: false
+      required: [pinned_at, reason]
+      properties:
+        pinned_at:
+          type: string
+          format: date-time
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 512
     VMPage:
       type: object
       additionalProperties: false
@@ -1722,7 +1738,7 @@ components:
       properties:
         action:
           type: string
-          enum: [restart, resize, release, destroy, port_add, port_remove]
+          enum: [restart, resize, release, destroy, pin, unpin, port_add, port_remove]
         expected_generation:
           type: string
           pattern: "^(0|[1-9][0-9]*)$"
@@ -1744,14 +1760,14 @@ components:
           type: string
           minLength: 1
           maxLength: 512
-          description: Optional audit reason; omission is valid and is retained as absent.
+          description: Optional audit reason; omission is valid and is retained as absent, except pin requires a reason that is also stored as the hold reason.
         target_version:
           type: string
           minLength: 1
           maxLength: 256
         action:
           type: string
-          enum: [restart, resize, release, destroy, port_add, port_remove]
+          enum: [restart, resize, release, destroy, pin, unpin, port_add, port_remove]
         expected_generation:
           type: string
           pattern: "^(0|[1-9][0-9]*)$"
@@ -2270,7 +2286,7 @@ components:
       enum: [drain_enter, reconcile, gc]
     ManagementAction:
       type: string
-      enum: [restart, resize, release, destroy, port_add, port_remove, image_import, default_image_select, image_retire, image_delete, token_create, token_revoke, drain_enter, reconcile, gc]
+      enum: [restart, resize, release, destroy, pin, unpin, port_add, port_remove, image_import, default_image_select, image_retire, image_delete, token_create, token_revoke, drain_enter, reconcile, gc]
     OperationPhase:
       type: string
       enum: [queued, awaiting_upload, upload, integrity_check, image_import, suitability_check, reference_check, token_creation, token_revocation, native_action, reconciliation, cleanup, completed]

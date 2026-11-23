@@ -16,11 +16,12 @@ type ActionDialogProps = {
   busy?: boolean;
   error?: string | null;
   confirmationText?: ReactNode;
+  reasonRequired?: boolean;
   returnFocusTarget?: HTMLElement | null;
   children?: ReactNode;
 };
 
-export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm, dangerous = false, busy = false, error, confirmationText, returnFocusTarget, children }: ActionDialogProps) {
+export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm, dangerous = false, busy = false, error, confirmationText, reasonRequired = false, returnFocusTarget, children }: ActionDialogProps) {
   const { t, i18n } = useTranslation();
   const locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const [reason, setReason] = useState("");
@@ -103,24 +104,25 @@ export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm
   }, [busy, onCancel]);
 
   const submit = () => {
-    if (reasonTooLong) return;
+    if (reasonTooLong || (reasonRequired && !reason.trim())) return;
     onConfirm(reason);
   };
+  const submitDisabled = busy || reasonTooLong || (reasonRequired && !reason.trim());
 
   return <dialog ref={dialogRef} open className="dialog-backdrop" aria-modal="true" aria-labelledby="action-dialog-title" onCancel={(event) => { event.preventDefault(); if (!busy) onCancel(); }}>
     <div className="action-dialog">
       <div className="dialog-heading"><div className={`dialog-icon ${dangerous ? "danger" : ""}`} aria-hidden="true">{dangerous ? <AlertTriangle /> : <ShieldCheck />}</div><div><h2 id="action-dialog-title">{t("vms.actionConfirm", { action: actionLabel })}</h2><p>{target}</p></div></div>
       <div className="dialog-target-row"><span>{t("dialog.preview")}</span><span className="mono">{preview.target_version}</span></div>
       <div className="impact-grid"><div><span>{t("dialog.impactSessions")}</span><strong>{preview.impact.affected_session_count}</strong></div><div><span>{t("dialog.impactRefs")}</span><strong>{Object.values(preview.impact.affected_image_references).reduce((total, value) => total + value, 0)}</strong></div></div>
-      <div className="dialog-changes"><span>{t("dialog.changes")}</span>{preview.impact.changes.map((change) => <div key={change.code}><span className="change-code">{change.code === "previous_fingerprint" ? t("images.oldTarget") : change.code === "new_fingerprint" ? t("images.newTarget") : change.code}</span><span>{change.value ?? change.count ?? t("dialog.noImpact")}</span></div>)}</div>
+      <div className="dialog-changes"><span>{t("dialog.changes")}</span>{preview.impact.changes.map((change) => <div key={change.code}><span className="change-code">{change.code === "previous_fingerprint" ? t("images.oldTarget") : change.code === "new_fingerprint" ? t("images.newTarget") : change.code === "pinned_vm_destroyed" ? t("dialog.pinnedVmDestroyed") : change.code === "hold_state_changed" ? t("dialog.holdStateChanged") : change.code}</span><span>{change.value ?? change.count ?? t("dialog.noImpact")}</span></div>)}</div>
       {children}
       {error ? <p className="field-error" role="alert">{error}</p> : null}
       <p className="dialog-expiry">{t("dialog.expires", { time: formatDateTime(preview.expires_at, locale) })}</p>
-      <label className="field-label" htmlFor="action-reason">{t("common.reason")} <span>({t("common.optional")})</span></label>
+      <label className="field-label" htmlFor="action-reason">{t("common.reason")} <span>({reasonRequired ? t("common.required") : t("common.optional")})</span></label>
       <Textarea ref={reasonRef} id="action-reason" value={reason} aria-invalid={reasonTooLong ? "true" : undefined} aria-describedby={reasonTooLong ? "action-reason-error" : undefined} onChange={(event) => setReason(event.target.value)} placeholder={t("common.reasonPlaceholder")} rows={3} />
       {reasonTooLong ? <p id="action-reason-error" className="field-error" role="alert">{t("common.reasonTooLong")}</p> : null}
       <p className="dialog-warning">{confirmationText ?? t("vms.actionConfirmText")}</p>
-      <div className="dialog-actions"><Button variant="ghost" disabled={busy} onClick={onCancel}>{t("common.cancel")}</Button><Button variant={dangerous ? "danger" : "primary"} disabled={busy || reasonTooLong} onClick={submit} icon={busy ? <ShieldCheck /> : <ArrowRight />}>{busy ? t("common.loading") : t("dialog.submit")}</Button></div>
+      <div className="dialog-actions"><Button variant="ghost" disabled={busy} onClick={onCancel}>{t("common.cancel")}</Button><Button variant={dangerous ? "danger" : "primary"} disabled={submitDisabled} onClick={submit} icon={busy ? <ShieldCheck /> : <ArrowRight />}>{busy ? t("common.loading") : t("dialog.submit")}</Button></div>
     </div>
   </dialog>;
 }

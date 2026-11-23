@@ -408,6 +408,30 @@ func TestGenerationTombstoneAdvancesAfterTaskDeletion(t *testing.T) {
 	}
 }
 
+func TestTaskConditionNoHoldRejectsPinnedTask(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "hold-condition.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	expired := "2000-01-01T00:00:00+00:00"
+	task := Task{TaskID: "avm-hold-condition", SessionID: "hold-condition", Generation: 3, State: "active", InstanceName: "agent-vm-hold-condition", CreatedAt: "now", UpdatedAt: "now", ImageFingerprint: "image", ResourcesJSON: "{}", ResourceReservationJSON: "{}", LeaseExpiresAt: &expired}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if pinned, err := store.PinTaskIf(ctx, task.TaskID, TaskCondition{Generation: &task.Generation, States: []string{"active"}}, "now", "review"); err != nil || !pinned {
+		t.Fatalf("pin = %v, err = %v", pinned, err)
+	}
+	if updated, err := store.UpdateTaskIf(ctx, task.TaskID, TaskCondition{Generation: &task.Generation, States: []string{"active"}, NoHold: true}, map[string]any{"state": "closing"}); err != nil || updated {
+		t.Fatalf("no-hold condition updated = %v, err = %v", updated, err)
+	}
+	now := time.Now().UTC()
+	if updated, err := store.UpdateTaskIf(ctx, task.TaskID, TaskCondition{Generation: &task.Generation, States: []string{"active"}, LeaseActiveAfter: &now}, map[string]any{"state": "closing"}); err != nil || !updated {
+		t.Fatalf("held lease-active condition updated = %v, err = %v", updated, err)
+	}
+}
+
 func TestTransactionErrorRetainsRollbackPhaseAndCommitState(t *testing.T) {
 	store, err := OpenForTest(filepath.Join(t.TempDir(), "transaction.sqlite3"))
 	if err != nil {

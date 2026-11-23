@@ -345,8 +345,13 @@ export async function previewVMAction(taskId: string, action: string, current?: 
   const state = getMockState();
   const vm = state.vms.find((candidate) => candidate.task_id === taskId);
   if (!vm) throw new ManagementRequestError("not_found");
+  if (action === "release" && vm.pinned) throw new ManagementRequestError("lease_pinned", "precondition");
+  if (action === "pin" && vm.pinned) throw new ManagementRequestError("already_pinned", "precondition");
+  if (action === "unpin" && !vm.pinned) throw new ManagementRequestError("not_pinned", "precondition");
   if (current && (current.resource_version !== vm.resource_version || current.generation !== vm.generation)) throw new ManagementRequestError("stale_target", "precondition", null, { current_target_version: vm.resource_version });
-  return delay(issueMockPreview(state, { kind: "vm", targetId: taskId, action, targetVersion: vm.resource_version, expectedGeneration: vm.generation, parameters }, { summary_code: vm.lease.state === "effective" ? "effective_lease_affected" : "no_active_lease", affected_session_count: vm.lease.state === "effective" ? 1 : 0, affected_image_references: { ...(state.images.find((image) => image.fingerprint === vm.image.fingerprint)?.references ?? emptyReferences) }, changes: [{ code: action === "destroy" ? "session_access_revoked" : "native_action", count: 1, value: null }] }));
+  const changes: Array<{ code: string; count: number; value: string | null }> = [{ code: action === "destroy" ? "session_access_revoked" : action === "pin" || action === "unpin" ? "hold_state_changed" : "native_action", count: 1, value: null }];
+  if (action === "destroy" && vm.pinned) changes.push({ code: "pinned_vm_destroyed", count: 1, value: vm.pinned.reason });
+  return delay(issueMockPreview(state, { kind: "vm", targetId: taskId, action, targetVersion: vm.resource_version, expectedGeneration: vm.generation, parameters }, { summary_code: vm.pinned ? "pinned_lease_affected" : vm.lease.state === "effective" ? "effective_lease_affected" : "no_active_lease", affected_session_count: vm.pinned || vm.lease.state === "effective" ? 1 : 0, affected_image_references: { ...(state.images.find((image) => image.fingerprint === vm.image.fingerprint)?.references ?? emptyReferences) }, changes }));
 }
 
 export async function submitVMAction(taskId: string, action: string, reason: string, preview: ActionPreview, expectedGeneration: string, parameters: Record<string, unknown> = {}, operationId = createOperationId()): Promise<Operation> {
@@ -357,6 +362,8 @@ export async function submitVMAction(taskId: string, action: string, reason: str
   const mockAction = action as Operation["action"];
   const target = { kind: "vm" as const, id: taskId };
   const normalizedReason = providedReason ?? "";
+  if (action === "pin" && !normalizedReason) throw new ManagementRequestError("invalid_request", "precondition");
+  if (action === "release" && state.vms.find((vm) => vm.task_id === taskId)?.pinned) throw new ManagementRequestError("lease_pinned", "precondition");
   const requestPayload = { action, taskId, reason: normalizedReason, expectedGeneration, targetVersion: preview.target_version, confirmationToken: preview.confirmation_token, parameters };
   if (state.operations.some((operation) => operation.operation_id === operationId)) return createMockOperation(mockAction, target, normalizedReason, undefined, operationId, requestPayload, parameters);
   const vm = state.vms.find((candidate) => candidate.task_id === taskId);
@@ -521,6 +528,7 @@ function createMockOperation(action: Operation["action"], target: Operation["tar
         vm.native_state = "absent";
         vm.guest_availability = "unavailable";
         vm.lease = { state: "absent", expires_at: null };
+        vm.pinned = null;
         vm.allowed_actions = [];
       }
       if (vm && action === "release") {
@@ -534,6 +542,16 @@ function createMockOperation(action: Operation["action"], target: Operation["tar
         vm.lease = { state: "absent", expires_at: null };
         vm.allowed_actions = ["release", "destroy"];
       }
+      if (vm && action === "pin") {
+		vm.pinned = { pinned_at: new Date().toISOString(), reason };
+        vm.lease = { state: "pinned", expires_at: vm.lease.expires_at };
+        vm.allowed_actions = ["restart", "resize", "destroy", "port_add", "port_remove", "unpin"];
+      }
+      if (vm && action === "unpin") {
+        vm.pinned = null;
+        vm.lease = { state: "effective", expires_at: new Date(Date.now() + 30 * 60_000).toISOString() };
+        vm.allowed_actions = ["restart", "resize", "release", "destroy", "port_add", "port_remove", "pin"];
+      }
       if (vm && action === "restart") { vm.native_state = "running"; vm.guest_availability = "ready"; }
       if (vm && action === "resize") {
         const nextResources = { ...vm.resources, cpu_vcpu: typeof effectParameters.cpu_vcpu === "number" ? effectParameters.cpu_vcpu : vm.resources.cpu_vcpu, memory_bytes: typeof effectParameters.memory_bytes === "string" ? effectParameters.memory_bytes : vm.resources.memory_bytes, disk_bytes: typeof effectParameters.disk_bytes === "string" ? effectParameters.disk_bytes : vm.resources.disk_bytes };
@@ -543,7 +561,7 @@ function createMockOperation(action: Operation["action"], target: Operation["tar
       if (vm && action === "port_add" && typeof effectParameters.port_name === "string" && typeof effectParameters.protocol === "string" && typeof effectParameters.host_port === "number" && typeof effectParameters.guest_port === "number") vm.port_mappings = [...vm.port_mappings.filter((port) => port.name !== effectParameters.port_name), { name: effectParameters.port_name, protocol: effectParameters.protocol as "tcp" | "udp", host_port: effectParameters.host_port, guest_port: effectParameters.guest_port }];
       if (vm && action === "port_remove" && typeof effectParameters.port_name === "string") vm.port_mappings = vm.port_mappings.filter((port) => port.name !== effectParameters.port_name);
       if (vm) vm.resource_version = `${vm.resource_version}:demo-${operationId.slice(0, 8)}`;
-      if (vm && ["destroy", "release", "resize", "port_add", "port_remove"].includes(action)) state.overview.resource_version = `${state.overview.resource_version}:demo-${operationId.slice(0, 8)}`;
+      if (vm && ["destroy", "release", "resize", "port_add", "port_remove", "pin", "unpin"].includes(action)) state.overview.resource_version = `${state.overview.resource_version}:demo-${operationId.slice(0, 8)}`;
     }
     if (target.kind === "image" && action === "default_image_select") {
       state.images.forEach((image) => {

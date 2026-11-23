@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { parseArgs, parseSize, dispatch } from "../scripts/agent_vm.ts";
+import { parseArgs, parseDuration, parseSize, dispatch } from "../scripts/agent_vm.ts";
 import { attachDiagnosis, sessionId, uncertain } from "../scripts/client.ts";
 import { CliError, equal, FloatToken, json, parseJson, readJson, sha256 } from "../scripts/client-io.ts";
 import { ACTIONS, CLIENT_DEPENDENCIES, capability, loadRelease } from "../scripts/client-release.ts";
@@ -272,6 +272,22 @@ test("lifecycle and admin commands retain action/generation/operation scope with
   expect(f.requests[8]).toMatchObject({ generation: 0 });
   await dispatch(parseArgs(["admin", "metrics"]), f.client); expect(f.requests.at(-1)).not.toHaveProperty("session_id"); expect(f.requests.at(-1)).not.toHaveProperty("operation_id");
   await expect(dispatch(selected(["admin", "metrics"]), f.client)).rejects.toMatchObject({ code: "invalid_request" });
+});
+
+test("hold commands and lease durations are validated before remote writes", async () => {
+  expect(parseDuration("5m", 300, 21600)).toBe(300);
+  expect(parseDuration("6h", 1800, 21600)).toBe(21600);
+  expect(() => parseDuration("299s", 300, 21600)).toThrow();
+  expect(() => parseDuration("6h1m", 300, 21600)).toThrow();
+  expect(parseArgs(["renew", "--lease", "90m"]).options.lease).toBe("90m");
+  expect(parseArgs(["acquire", "--lease", "5h"]).options.lease).toBe("5h");
+  const f = fixture(); f.state();
+  await dispatch(selected(["pin", "--reason", "hold for owner review"]), f.client);
+  expect(f.requests.at(-1)).toMatchObject({ action: "pin", reason: "hold for owner review", generation: 7 });
+  await dispatch(selected(["unpin"]), f.client);
+  expect(f.requests.at(-1)).toMatchObject({ action: "unpin", generation: 7 });
+  await expect(dispatch(selected(["pin"]), f.client)).rejects.toMatchObject({ code: "invalid_request" });
+  expect(f.requests.at(-1)?.action).toBe("unpin");
 });
 
 test("local recovery state is locked, monotonic and cleanup-only safe", () => {
