@@ -21,6 +21,7 @@
         "state": "effective",
         "expires_at": "2026-01-15T11:20:00Z"
       },
+      "pinned": null,
       "port_mappings": [
         {
           "name": "preview",
@@ -31,7 +32,7 @@
       ],
       "last_error": null,
       "updated_at": "2026-01-15T10:19:00Z",
-      "allowed_actions": ["restart", "resize", "release", "destroy", "port_add", "port_remove"]
+      "allowed_actions": ["restart", "resize", "release", "destroy", "pin", "port_add", "port_remove"]
     }
   ],
   "page": {

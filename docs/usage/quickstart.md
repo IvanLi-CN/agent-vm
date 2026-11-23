@@ -39,7 +39,7 @@ agent-vm --session-id <session> renew
 agent-vm --session-id <session> release
 ```
 
-租约即将到期时显式执行 `renew`。`release` 会撤销访问并停止来宾，可能保留合格缓存；它不是普通关机，也不保证缓存永久保留。需要彻底删除时使用 `destroy`，并先确认数据已导出。
+租约即将到期时显式执行 `renew`；可用 `--lease 30m` 到 `6h` 指定增加量。需要跨长时间任务保留时执行 `pin --reason "<理由>"`，取消保留使用 `unpin`，之后会按首租默认时长重新计算截止时间。`release` 会撤销访问并停止来宾，可能保留合格缓存；它不是普通关机，也不保证缓存永久保留，且保留中的 VM 必须先 unpin。需要彻底删除时使用 `destroy`，并先确认数据已导出。
 
 ## 结果不确定时
 

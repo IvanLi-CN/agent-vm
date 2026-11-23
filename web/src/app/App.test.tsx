@@ -44,6 +44,21 @@ describe("management console workflow", () => {
     expect(screen.getAllByText("session_aurora_02")).toHaveLength(2);
   });
 
+  it("shows pinned hold state and warns before destroying a pinned VM", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/vms");
+    renderApp();
+    expect(await screen.findByTestId("vms-page")).toBeInTheDocument();
+    await user.click(await screen.findByRole("option", { name: /task aurora 02/i }));
+    expect(screen.getAllByText(/保留中|Held/i).length).toBeGreaterThan(0);
+    expect(screen.getByText("Awaiting owner review of the migration result")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /取消保留|clear hold/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /释放租约|release lease/i })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /销毁|destroy/i }));
+    const warning = await screen.findByText(/处于保留状态|is held/i);
+    expect(warning).toHaveTextContent(/Awaiting owner review of the migration result/);
+  });
+
   it("switches language without removing the current page", async () => {
     const user = userEvent.setup();
     window.history.replaceState({}, "", "/");

@@ -59,7 +59,7 @@ func testAuthority(t *testing.T) (*Authority, *state.Store, config.ManagementCon
 
 type maintenanceActionBackend struct{}
 
-func (maintenanceActionBackend) ExecuteVMAction(context.Context, string, string, string, int64, map[string]any) (map[string]any, error) {
+func (maintenanceActionBackend) ExecuteVMAction(context.Context, string, string, string, int64, string, map[string]any) (map[string]any, error) {
 	return map[string]any{"state": "changed"}, nil
 }
 
@@ -295,6 +295,30 @@ func TestVMLeaseRequiresActiveState(t *testing.T) {
 				t.Fatalf("lease state = %v, want %s", got, want)
 			}
 		})
+	}
+}
+
+func TestVMPinValueExposesHoldAndAllowedActions(t *testing.T) {
+	authority, _, _ := testAuthority(t)
+	now := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	authority.Clock = func() time.Time { return now }
+	expires := now.Add(-time.Minute).Format(time.RFC3339Nano)
+	pinnedAt := now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	reason := "awaiting owner review"
+	value, err := authority.vmValue(context.Background(), &state.Task{TaskID: "pinned-view", SessionID: "pinned-session", Generation: 3, State: "active", LeaseExpiresAt: &expires, PinnedAt: &pinnedAt, PinReason: &reason, ImageFingerprint: strings.Repeat("a", 64), ResourcesJSON: "{}"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value["lease"].(map[string]any)["state"] != "pinned" {
+		t.Fatalf("lease = %#v", value["lease"])
+	}
+	pinned, ok := value["pinned"].(map[string]any)
+	if !ok || pinned["reason"] != reason || pinned["pinned_at"] != pinnedAt {
+		t.Fatalf("pinned = %#v", value["pinned"])
+	}
+	allowed := value["allowed_actions"].([]string)
+	if containsString(allowed, "release") || containsString(allowed, "pin") || !containsString(allowed, "unpin") {
+		t.Fatalf("allowed actions = %#v", allowed)
 	}
 }
 

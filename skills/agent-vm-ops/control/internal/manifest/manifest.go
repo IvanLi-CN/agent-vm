@@ -42,6 +42,7 @@ var stateCapabilityMarkers = []string{
 	"principal-identity@1",
 	"session-image-binding@1",
 	"token-revocation@1",
+	"vm-hold@1",
 }
 
 var actionNames = func() []string {
@@ -53,16 +54,36 @@ var actionNames = func() []string {
 	return names
 }()
 
-// Supported releases before image selection retain their original capability set.
-var historicalActionNames = func() []string {
-	names := make([]string, 0, len(actionNames)-1)
-	for _, action := range actionNames {
-		if action != "image-list" {
-			names = append(names, action)
+func actionSetSupported(object map[string]any) bool {
+	for _, removed := range [][]string{
+		nil,
+		{"image-list"},
+		{"pin", "unpin"},
+		{"image-list", "pin", "unpin"},
+	} {
+		if sameKeys(object, withoutActions(actionNames, removed...)) {
+			return true
 		}
 	}
-	return names
-}()
+	return false
+}
+
+func withoutActions(names []string, removed ...string) []string {
+	result := make([]string, 0, len(names))
+	for _, name := range names {
+		drop := false
+		for _, candidate := range removed {
+			if name == candidate {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			result = append(result, name)
+		}
+	}
+	return result
+}
 
 var retiredUnits = []string{
 	"agent-vm-native-age-gc.service",
@@ -680,14 +701,14 @@ func stateCompatibility(value any) ([]string, []string, error) {
 	}
 	parse := func(value any, label string) ([]string, error) {
 		values, ok := value.([]any)
-		if !ok || len(values) != len(stateCapabilityMarkers) {
-			return nil, fmt.Errorf("manifest_state_compatibility_invalid: %s must declare all state capability markers", label)
+		if !ok || len(values) == 0 || len(values) > len(stateCapabilityMarkers) {
+			return nil, fmt.Errorf("manifest_state_compatibility_invalid: %s must declare a supported state capability prefix", label)
 		}
 		result := make([]string, len(values))
 		for index, raw := range values {
 			item, ok := raw.(string)
 			if !ok || item != stateCapabilityMarkers[index] {
-				return nil, fmt.Errorf("manifest_state_compatibility_invalid: %s must use the fixed sorted marker set", label)
+				return nil, fmt.Errorf("manifest_state_compatibility_invalid: %s must use a supported sorted marker prefix", label)
 			}
 			result[index] = item
 		}
@@ -792,7 +813,7 @@ func validateArtifacts(value any) ([]checkedArtifact, error) {
 
 func validateOperationMap(value any, label string) error {
 	object, ok := value.(map[string]any)
-	if !ok || (!sameKeys(object, actionNames) && !sameKeys(object, historicalActionNames)) {
+	if !ok || !actionSetSupported(object) {
 		return fmt.Errorf("manifest_action_set_invalid: %s differs from the fixed control surface", label)
 	}
 	for action := range object {

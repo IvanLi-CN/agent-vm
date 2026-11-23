@@ -22,6 +22,7 @@ Mutation 前检查精确的 candidate revision/checksum、component version、na
 
 计划维护时进入 `agent-vm admin drain enter`，检查 drain status，等待 effective lease 结束，并确认 cleanup 已关闭 NAT/flow 且停止 container。
 Drain 拒绝新的 lease 和 restart admission，允许在线 retrieval/release，不会静默延长 deadline。
+pinned VM 不会自行到期，可能让 drain 等待无法收敛。先按 session/task 列出保留目标和理由，交由 owner 决定 unpin、release 或 destroy；不要代替其他会话强行 unpin，也不要把保留中的 VM 当作可回收 cache。
 已经越过短 admission fence 的 restart 可以在不持有 global lock 的情况下完成。
 强制中断需要单独的明确授权，并列出受影响的 resource。
 

@@ -118,7 +118,7 @@ type ImageArtifact struct {
 }
 
 type ActionBackend interface {
-	ExecuteVMAction(context.Context, string, string, string, int64, map[string]any) (map[string]any, error)
+	ExecuteVMAction(context.Context, string, string, string, int64, string, map[string]any) (map[string]any, error)
 	ExecuteMaintenance(context.Context, string, string, map[string]any) (map[string]any, error)
 }
 
@@ -126,7 +126,7 @@ type ActionBackend interface {
 // lifecycle session lock, closing the gap between browser validation and the
 // native action when CLI activity races with a management request.
 type VersionedVMActionBackend interface {
-	ExecuteVMActionWithVersion(context.Context, string, string, string, int64, string, map[string]any) (map[string]any, error)
+	ExecuteVMActionWithVersion(context.Context, string, string, string, int64, string, string, map[string]any) (map[string]any, error)
 }
 
 // VMActionGuard lets the native adapter re-check ownership immediately before
@@ -1449,7 +1449,7 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 	} else if existing != nil && existing.Status != "queued" {
 		return existing, nil
 	}
-	if request.Action != "release" && request.Action != "destroy" {
+	if request.Action != "release" && request.Action != "destroy" && request.Action != "pin" && request.Action != "unpin" {
 		if err := s.rejectNewManagementAction(ctx); err != nil {
 			return nil, err
 		}
@@ -1471,8 +1471,11 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 	if request.TargetVersion != currentVersion {
 		return nil, errors.New("stale_target: VM resource version changed")
 	}
-	if !contains([]string{"restart", "resize", "release", "destroy", "port_add", "port_remove"}, request.Action) {
+	if !contains([]string{"restart", "resize", "release", "destroy", "port_add", "port_remove", "pin", "unpin"}, request.Action) {
 		return nil, errors.New("unsupported_action: VM action is not allowed")
+	}
+	if request.Action == "pin" && strings.TrimSpace(request.Reason) == "" {
+		return nil, errors.New("invalid_request: pin requires a non-empty reason")
 	}
 	if err := validateVMActionFence(task, request.Action, s.Clock()); err != nil {
 		return nil, err
@@ -1520,9 +1523,9 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 	var result map[string]any
 	var actionErr error
 	if versioned, ok := s.Options.Actions.(VersionedVMActionBackend); ok {
-		result, actionErr = versioned.ExecuteVMActionWithVersion(ctx, request.OperationID, request.Action, request.TaskID, request.ExpectedGeneration, request.TargetVersion, request.Parameters)
+		result, actionErr = versioned.ExecuteVMActionWithVersion(ctx, request.OperationID, request.Action, request.TaskID, request.ExpectedGeneration, request.TargetVersion, request.Reason, request.Parameters)
 	} else {
-		result, actionErr = s.Options.Actions.ExecuteVMAction(ctx, request.OperationID, request.Action, request.TaskID, request.ExpectedGeneration, request.Parameters)
+		result, actionErr = s.Options.Actions.ExecuteVMAction(ctx, request.OperationID, request.Action, request.TaskID, request.ExpectedGeneration, request.Reason, request.Parameters)
 	}
 	if mutationLost() || !s.mutationAllowed() {
 		return nil, controllerLeaseLostError(actionErr)
@@ -1654,10 +1657,40 @@ func validateVMActionFence(task *state.Task, action string, now time.Time) error
 	if task == nil || task.State == "absent" {
 		return errors.New("stale_target: VM is not available")
 	}
-	if action == "release" || action == "destroy" {
+	if action == "release" {
+		if task.PinnedAt != nil {
+			return errors.New("lease_pinned: unpin the VM before releasing it")
+		}
 		return nil
 	}
-	if task.State != "active" || task.LeaseExpiresAt == nil {
+	if action == "destroy" {
+		return nil
+	}
+	if action == "pin" {
+		if task.State != "active" {
+			return errors.New("stale_target: VM lease is not active")
+		}
+		if task.PinnedAt != nil {
+			return errors.New("already_pinned: VM is already pinned")
+		}
+		return nil
+	}
+	if action == "unpin" {
+		if task.State != "active" {
+			return errors.New("stale_target: VM lease is not active")
+		}
+		if task.PinnedAt == nil {
+			return errors.New("not_pinned: VM is not pinned")
+		}
+		return nil
+	}
+	if task.State != "active" {
+		return errors.New("stale_target: VM lease is not active")
+	}
+	if task.PinnedAt != nil {
+		return nil
+	}
+	if task.LeaseExpiresAt == nil {
 		return errors.New("stale_target: VM lease is not active")
 	}
 	lease, err := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt)

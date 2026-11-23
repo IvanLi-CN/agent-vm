@@ -153,7 +153,7 @@ type blockingActionBackend struct {
 	once    sync.Once
 }
 
-func (backend *fakeActionBackend) ExecuteVMAction(context.Context, string, string, string, int64, map[string]any) (map[string]any, error) {
+func (backend *fakeActionBackend) ExecuteVMAction(context.Context, string, string, string, int64, string, map[string]any) (map[string]any, error) {
 	backend.vmCalls++
 	return map[string]any{"state": "changed"}, backend.err
 }
@@ -1406,6 +1406,33 @@ func TestFinishOperationPersistsAfterExecutionContextExpires(t *testing.T) {
 	}
 	if len(audits) == 0 || audits[0].OperationID == nil || *audits[0].OperationID != request.OperationID {
 		t.Fatalf("audits = %#v", audits)
+	}
+}
+
+func TestVMActionFenceHonorsHold(t *testing.T) {
+	now := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	expired := now.Add(-time.Minute).Format(time.RFC3339Nano)
+	pinnedAt := now.Add(-time.Hour).Format(time.RFC3339Nano)
+	reason := "awaiting owner review"
+	pinned := &state.Task{TaskID: "pinned", State: "active", LeaseExpiresAt: &expired, PinnedAt: &pinnedAt, PinReason: &reason}
+	if err := validateVMActionFence(pinned, "restart", now); err != nil {
+		t.Fatalf("pinned restart = %v", err)
+	}
+	if err := validateVMActionFence(pinned, "destroy", now); err != nil {
+		t.Fatalf("pinned destroy = %v", err)
+	}
+	if err := validateVMActionFence(pinned, "release", now); err == nil || !strings.Contains(err.Error(), "lease_pinned") {
+		t.Fatalf("pinned release = %v", err)
+	}
+	if err := validateVMActionFence(pinned, "pin", now); err == nil || !strings.Contains(err.Error(), "already_pinned") {
+		t.Fatalf("pinned pin = %v", err)
+	}
+	if err := validateVMActionFence(pinned, "unpin", now); err != nil {
+		t.Fatalf("pinned unpin = %v", err)
+	}
+	unpinned := &state.Task{TaskID: "unpinned", State: "active"}
+	if err := validateVMActionFence(unpinned, "pin", now); err != nil {
+		t.Fatalf("pin without deadline = %v", err)
 	}
 }
 

@@ -78,9 +78,11 @@ ACTION_NAMES = (
     "admin-status",
     "destroy",
     "doctor",
+    "image-list",
     "drain-enter",
     "drain-exit",
     "drain-status",
+    "pin",
     "port-add",
     "port-list",
     "port-remove",
@@ -93,6 +95,12 @@ ACTION_NAMES = (
     "timer-age-gc",
     "timer-expire",
     "timer-reconcile",
+    "unpin",
+)
+LEGACY_ACTION_NAMES = tuple(action for action in ACTION_NAMES if action != "image-list")
+LEGACY_ACTION_SETS = (
+    set(LEGACY_ACTION_NAMES),
+    set(LEGACY_ACTION_NAMES) - {"pin", "unpin"},
 )
 HISTORICAL_GO_ACTION_NAMES = tuple(action for action in ACTION_NAMES if action != "admin-reconcile-session")
 
@@ -245,6 +253,7 @@ STATE_CAPABILITY_MARKERS = (
     "principal-identity@1",
     "session-image-binding@1",
     "token-revocation@1",
+    "vm-hold@1",
 )
 PRODUCT_BUN_TOOLCHAIN = "1.4.4"
 PRODUCT_GO_TOOLCHAIN = "go1.27.3"
@@ -436,13 +445,17 @@ def default_operations() -> dict[str, dict[str, Any]]:
     return {action: operation_spec() for action in ACTION_NAMES}
 
 
+def legacy_operations() -> dict[str, dict[str, Any]]:
+    return {action: operation_spec() for action in LEGACY_ACTION_NAMES}
+
+
 def legacy_manifest() -> dict[str, Any]:
     """Return the explicit protocol-4 fallback used by pre-manifest installs."""
     artifacts = [
         {"name": name, "path": path, "role": role, "sha256": "0" * 64, "mode": mode}
         for name, path, role, mode in sorted(FIXED_ARTIFACTS)
     ]
-    actions = default_operations()
+    actions = legacy_operations()
     return {
         "format": MANIFEST_FORMAT,
         "release_id": "0" * 40,
@@ -472,7 +485,7 @@ def build_manifest(
         "source_revision": source_revision,
         "protocol": PROTOCOL_VERSION,
         "artifacts": [dict(item) for item in artifacts],
-        "actions": {key: dict(value) for key, value in (operations or default_operations()).items()},
+        "actions": {key: dict(value) for key, value in (operations or legacy_operations()).items()},
     }
     manifest["client_view"] = {
         "release_id": source_revision,
@@ -539,11 +552,11 @@ def validate_manifest(value: Any) -> dict[str, Any]:
             "manifest declares an unsupported action",
             {"actions": sorted(unsupported_actions)},
         )
-    if set(raw_actions) != set(ACTION_NAMES):
+    if set(raw_actions) not in LEGACY_ACTION_SETS:
         raise _error(
             "manifest_action_set_invalid",
             "manifest action set differs from the fixed control surface",
-            {"expected": list(ACTION_NAMES), "actual": sorted(raw_actions)},
+            {"expected": list(LEGACY_ACTION_NAMES), "actual": sorted(raw_actions)},
         )
     actions: dict[str, dict[str, Any]] = {}
     for action, raw_spec in raw_actions.items():
@@ -597,8 +610,15 @@ def validate_manifest(value: Any) -> dict[str, Any]:
 
 def _validate_go_actions(value: Any, *, allow_historical_action_set: bool = False) -> dict[str, dict[str, Any]]:
     raw_actions = _require_mapping(value, "actions")
-    accepted_action_sets = [set(ACTION_NAMES), set(ACTION_NAMES) | {"image-list"}]
+    full_actions = set(ACTION_NAMES)
+    accepted_action_sets = [
+        full_actions - removed
+        for removed in (set(), {"image-list"}, {"pin", "unpin"}, {"image-list", "pin", "unpin"})
+    ]
     if allow_historical_action_set:
+        accepted_action_sets.extend(
+            actions - {"admin-reconcile-session"} for actions in list(accepted_action_sets)
+        )
         accepted_action_sets.append(set(HISTORICAL_GO_ACTION_NAMES))
     if set(raw_actions) not in accepted_action_sets:
         raise _error(

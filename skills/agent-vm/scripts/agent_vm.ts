@@ -12,19 +12,22 @@ import { applyHostSelection, ensureConfig, loadHostConfig, resolveHost, configPa
 
 const HELP = `Usage: agent-vm [--host ALIAS] [--session-id ID] COMMAND [OPTIONS]
 Commands: version, help, doctor, status, acquire, renew, release, destroy, restart,
-  resize, ssh-info, ssh, exec -- ARGV, sync --name NAME, upload SOURCE DESTINATION,
+  pin, unpin, resize, ssh-info, ssh, exec -- ARGV, sync --name NAME, upload SOURCE DESTINATION,
   download SOURCE DESTINATION, export PATH, port add|list|remove,
   admin status|metrics|session list|drain enter|status|exit|reconcile|reconcile-session|gc.
 Scoped reconciliation: --session-id ID --task-id ID --generation N --pending-operation-id ID [--apply].
 Image selection: acquire --image NAME_OR_FULL_FINGERPRINT; image list.
 Mutation options: --operation-id ID. Resource options: --cpu N --memory SIZE --disk SIZE.
+Lease options: acquire --lease 5m..6h; renew --lease 30m..6h.
+Hold options: pin --reason TEXT; unpin [--reason TEXT].
 Resize: --live (memory only) or --allow-restart. Use COMMAND --help for options.
 Recovery errors include bounded status guidance; add --explain to a session mutation or reconciliation command for a bounded metrics summary and read-only recovery preview.
 `;
 const paths: Record<string, string[]> = {
   version: [], help: [], doctor: [], status: [], "image list": [],
-  acquire: ["image", "ssh-host-port", "cpu", "memory", "disk", "operation-id", "explain"],
-  renew: ["operation-id", "explain"], release: ["operation-id", "explain"], destroy: ["operation-id", "explain"], restart: ["operation-id", "explain"],
+  acquire: ["image", "ssh-host-port", "cpu", "memory", "disk", "lease", "operation-id", "explain"],
+  renew: ["lease", "operation-id", "explain"], release: ["operation-id", "explain"], destroy: ["operation-id", "explain"], restart: ["operation-id", "explain"],
+  pin: ["reason", "operation-id", "explain"], unpin: ["reason", "operation-id", "explain"],
   resize: ["cpu", "memory", "disk", "live", "allow-restart", "operation-id", "explain"],
   "ssh-info": ["format"], ssh: [], exec: [], sync: ["name"], upload: [], download: [], export: [],
   "port add": ["guest-port", "protocol", "host-port", "operation-id", "explain"], "port list": [], "port remove": ["protocol", "operation-id", "explain"],
@@ -71,6 +74,13 @@ export function parseSize(value: string, memory: boolean): number | bigint {
   const n = BigInt(m[1]) * (memory && /^g/i.test(m[2]) ? 1024n : 1n);
   return n <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(n) : n;
 }
+export function parseDuration(value: string, minimumSeconds: number, maximumSeconds: number): number {
+  const match = /^(\d+)(m|h)$/i.exec(value);
+  if (!match) fail("invalid_request", "duration must use minutes (m) or hours (h), for example 30m or 6h");
+  const seconds = Number(match[1]) * (/^h$/i.test(match[2]) ? 3600 : 60);
+  if (!Number.isSafeInteger(seconds) || seconds < minimumSeconds || seconds > maximumSeconds) fail("invalid_request", `duration must be between ${minimumSeconds} and ${maximumSeconds} seconds`);
+  return seconds;
+}
 export async function dispatch(args: Args, client = new Client(), native = inherited): Promise<Data | string | number> {
   const { command: cmd, options: o, positional: pos, rest } = args;
   if (cmd === "help") return HELP;
@@ -109,6 +119,7 @@ export async function dispatch(args: Args, client = new Client(), native = inher
     }
   };
   const resources = (): Data => ({ ...(o.cpu === undefined ? {} : { cpu: o.cpu }), ...(o.memory === undefined ? {} : { memory_mib: parseSize(o.memory, true) }), ...(o.disk === undefined ? {} : { disk_gib: parseSize(o.disk, false) }) });
+  const lease = (minimumSeconds: number, maximumSeconds: number): Data => (o.lease === undefined ? {} : { lease_seconds: parseDuration(String(o.lease), minimumSeconds, maximumSeconds) });
   if (["doctor", "status"].includes(cmd)) {
     const response = await client.request(cmd, { session });
     if (cmd === "status") client.reconcileServerState(session!, response.result);
@@ -125,7 +136,7 @@ export async function dispatch(args: Args, client = new Client(), native = inher
     }
     let response: Data;
     try {
-      response = await mutate(cmd, { public_key: publicKey, ...resources(), ...(o.image === undefined ? {} : { image: o.image }), ...(o["ssh-host-port"] === undefined ? {} : { ssh_host_port: o["ssh-host-port"] }) }, generation, acquireOperationId);
+      response = await mutate(cmd, { public_key: publicKey, ...resources(), ...lease(300, 21600), ...(o.image === undefined ? {} : { image: o.image }), ...(o["ssh-host-port"] === undefined ? {} : { ssh_host_port: o["ssh-host-port"] }) }, generation, acquireOperationId);
     } catch (error) {
       let diagnosis;
       try { diagnosis = await attachDiagnosis(error, client, session!, acquireOperationId, !!o.explain); } catch { diagnosis = error; }
@@ -143,7 +154,11 @@ export async function dispatch(args: Args, client = new Client(), native = inher
     return response;
   }
   if (["renew", "release", "destroy", "restart"].includes(cmd))
-    return mutate(cmd, {}, cmd === "release" || cmd === "destroy" ? client.generation(session!, true) : undefined);
+    return mutate(cmd, cmd === "renew" ? lease(1800, 21600) : {}, cmd === "release" || cmd === "destroy" ? client.generation(session!, true) : undefined);
+  if (cmd === "pin" || cmd === "unpin") {
+    if (cmd === "pin" && (typeof o.reason !== "string" || !o.reason.trim())) fail("invalid_request", "pin requires --reason TEXT");
+    return mutate(cmd, o.reason === undefined ? {} : { reason: String(o.reason) });
+  }
   if (cmd === "resize") {
     if (o.live && (o.memory === undefined || o.cpu !== undefined || o.disk !== undefined)) fail("invalid_request", "--live requires only --memory; CPU/disk changes use --allow-restart");
     return mutate(cmd, { allow_restart: !!o["allow-restart"], live_memory: !!o.live, ...resources() });

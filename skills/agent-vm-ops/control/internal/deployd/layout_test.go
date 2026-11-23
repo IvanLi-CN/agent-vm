@@ -53,7 +53,7 @@ func installLayoutFixture(t *testing.T, root, slot string, consolidated bool) st
 	for name := range protocol.Actions {
 		actions[name] = map[string]any{"request": map[string]any{"schema": 1, "semantic_revision": 1}, "response": map[string]any{"schema": 1, "semantic_revision": 1}, "client_to_control": map[string]any{"schema_min": 1, "schema_max": 1, "semantic_min": 1, "semantic_max": 1}, "control_to_client": map[string]any{"schema_min": 1, "schema_max": 1, "semantic_min": 1, "semantic_max": 1}}
 	}
-	caps := []string{"legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "oidc-return-path@1", "principal-identity@1", "session-image-binding@1", "token-revocation@1"}
+	caps := []string{"legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "oidc-return-path@1", "principal-identity@1", "session-image-binding@1", "token-revocation@1", "vm-hold@1"}
 	revision := strings.Repeat("a", 40)
 	manifest := map[string]any{"format": 4, "version": "1.0.0", "release_id": revision, "source_revision": revision, "protocol": 4, "target": map[string]any{"os": "linux", "arch": runtime.GOARCH}, "toolchain": map[string]any{"go": "go1.27.3", "bun": "1.4.4", "cgo_enabled": false}, "artifacts": artifacts, "actions": actions, "client_view": map[string]any{"version": "1.0.0", "source_revision": revision, "protocol": 4, "transport": "go-request", "actions": actions}, "state_compatibility": map[string]any{"reads": caps, "writes": caps}}
 	data, err := json.Marshal(manifest)

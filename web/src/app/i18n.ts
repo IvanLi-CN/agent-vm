@@ -132,6 +132,24 @@ i18n.addResource("en", "translation", "operationRecovery.notFound", "No authorit
 i18n.addResource("en", "translation", "operationRecovery.error", "The original operation could not be reconciled. Check again before starting a new action.");
 i18n.addResource("en", "translation", "operationRecovery.retry", "Check again");
 i18n.addResource("en", "translation", "errors.operationRecoveryRequired", "Reconcile the original operation before starting a new action.");
+i18n.addResource("zh-CN", "translation", "status.pinned", "保留中");
+i18n.addResource("en", "translation", "status.pinned", "Held");
+i18n.addResource("zh-CN", "translation", "vms.pinnedAt", "保留时间");
+i18n.addResource("en", "translation", "vms.pinnedAt", "Held at");
+i18n.addResource("zh-CN", "translation", "vms.pinReason", "保留理由");
+i18n.addResource("en", "translation", "vms.pinReason", "Hold reason");
+i18n.addResource("zh-CN", "translation", "vms.pinnedDestroyWarning", "该 VM 处于保留状态：{{reason}}。原到期时间 {{at}}；销毁会删除这个受保护的工作环境。");
+i18n.addResource("en", "translation", "vms.pinnedDestroyWarning", "This VM is held: {{reason}}. The frozen expiry was {{at}}; destroying it removes this protected work environment.");
+i18n.addResource("zh-CN", "translation", "errors.lease_pinned", "VM 处于保留状态，请先取消保留。");
+i18n.addResource("en", "translation", "errors.lease_pinned", "The VM is held; clear the hold first.");
+i18n.addResource("zh-CN", "translation", "errors.already_pinned", "VM 已经处于保留状态。");
+i18n.addResource("en", "translation", "errors.already_pinned", "The VM is already held.");
+i18n.addResource("zh-CN", "translation", "errors.not_pinned", "VM 当前没有保留。");
+i18n.addResource("en", "translation", "errors.not_pinned", "The VM is not held.");
+i18n.addResource("zh-CN", "translation", "dialog.pinnedVmDestroyed", "销毁保留中的 VM");
+i18n.addResource("en", "translation", "dialog.pinnedVmDestroyed", "Destroy held VM");
+i18n.addResource("zh-CN", "translation", "dialog.holdStateChanged", "VM 保留状态变更");
+i18n.addResource("en", "translation", "dialog.holdStateChanged", "VM hold changed");
 
 export async function changeLocale(locale: Locale): Promise<void> {
   if (typeof window !== "undefined") window.localStorage.setItem("agent-vm-locale", locale);

@@ -224,6 +224,14 @@ Incus 运行环境、域名及 OIDC 注册必须作为明确前置条件；部�
 
 Reconcile 必须在既有两秒、四条 pending 和十六条 task 的有界预算内公平推进扫描。未知 journal 或单个 task 的失败必须保留并持续报告，但不能永久饿死其他会话的过期清理；游标表示尝试位置，回绕后必须重试未解决对象。维护失败必须持久影响 doctor、admission_ready 与新 acquire/restart 准入；读取、取回、续租、释放和 scheduler 清理保持可用，只有 pending/task 两个扫描均完成无失败周期后才清除故障。已经同代 cached 的 release 必须先验证保存请求、digest、代次、可选 binding、worker/进程组静止、原生 ownership/Stopped、无 lease/预留/端口/proxy，才能保留原 evidence 并终结 journal，不得重放原生 release。手工全局 reconcile 对单个 orphan acquire 的校验失败仍须返回失败，同时允许清理其他会话的已到期任务。
 
+### REQ-AGENT-VM-036 - VM 保留与租约区间
+
+VM 保留必须是独立于租约的持久保护状态，只在任务为 `active` 时生效；其他状态必须拒绝保留。保留必须要求有界且非空的理由，保存保留起始时间和执行保留时的租约截止时间作为冻结证据，并且不得因该时间到期而关闭访问、停止来宾或进入清理；到期调度、维护补偿和重启恢复都必须跳过保留任务。保留期间允许重启、调整、端口变更、SSH 和执行，拒绝续租与释放；销毁仍然允许，但影响预览和二次确认必须明确显示保留状态、理由和冻结的截止时间。取消保留必须清除当前保留记录，并从当前时刻按配置的首租默认时长重新计算截止时间，再按从当前时刻计算的配置上限封顶；不得恢复冻结的旧截止时间。保留必须计入资源预留并阻止所有自动回收，容量不足时拒绝新准入，只有显式释放或销毁可以结束保留 VM。保留记录必须使用可增量升级的状态结构，不得通过重写既有 `tasks` schema 使受支持的旧权威无法打开数据库。
+
+首次租期和续期必须支持显式时长。获取可以指定 5 分钟至 6 小时的首租时长，省略时使用配置默认值；续期可以指定 30 分钟至 6 小时的增加量，省略时使用配置默认值，并以当前截止时间为基准增加后按从当前时刻计算的上限封顶。默认值必须调整为首次 30 分钟、续期 30 分钟、剩余上限 6 小时；部署可以调低上限，显式请求不得超过该部署上限。所有区间必须在任何持久写入或原生影响前校验，不支持的字段或动作必须明确拒绝，不得不带时长静默重试。
+
+协议 4 必须以增量字段暴露保留状态；保留时 `effective_lease` 继续保持可用语义，精确的租约状态由 `lease_state=pinned` 表达。管理 API 必须增加 `lease.state=pinned`、保留元数据和相应允许动作，列表、筛选及销毁确认必须能识别保留状态并完成中英文文案。新增 `vm-hold@1` 状态能力标记，不声明该能力的发布包不得激活包含保留状态的共享数据库。`agent-vm` skill 必须提供 `pin` 和 `unpin` 的操作说明，要求保留说明理由，并要求取消保留的目标不属于当前 agent session 时先取得人类批准；不得把保留描述为后台保活或永久租约。
+
 ## 同步与取回
 
 TypeScript/Bun 同步助手将受 Git 跟踪且未忽略的工作树文件传输到所属来宾源码目录，只原子替换助手拥有的内容。Git 文件选择、清单和原生文件系统访问必须保留路径字节、符号链接目标、权限和哈希；不支持的本地根路径表示必须明确失败。传输前拒绝子模块、符号链接父目录、保留的归属文件名和不安全名称。来宾事务是内存中的 Bun 操作，受受管镜像运行时、原生前置条件和外部执行期限保护；缺少 Bun 或原子操作能力时必须拒绝继续。原生锁、独占准备、基线身份比较、fsync 和原子目录交换，在冲突与失败时必须保留当前源码及相邻结果。提交结果不确定时，保留源码标记和准确恢复记录，返回退出码 75，不得推断已经回滚。[CLI 合同](contracts/cli.md#source-synchronization-transaction)定义执行边界、归属和恢复。导出直接向调用方流式发送 tar 归档，不创建服务端归档。
@@ -231,6 +239,8 @@ TypeScript/Bun 同步助手将受 Git 跟踪且未忽略的工作树文件传输
 ## Verification
 
 - `VER-AGENT-VM-033` 覆盖: `REQ-AGENT-VM-033`，通过 maintenance recovery、cached release、admission health 回归及隔离 Incus 的 scheduler/有效租约保护验证；`TestLegacyTimerRecoveryUsesBoundedTaskPage` 验证旧维护日志只恢复一页任务时，持久故障及扫描周期标志保持不变，新服务实例仍拒绝新准入。
+
+- `VER-AGENT-VM-036` 覆盖：`REQ-AGENT-VM-036` 通过[VM 保留与租约区间 ADR](../../adr/0056-agent-vm-vm-hold-and-lease-bands.md)、生命周期到期与维护补偿回归、租约区间边界测试、管理 API 与 Web 销毁确认测试、`vm-hold@1` 能力标记检查及 `bin/test_agent_vm_documentation.py`。
 
 - `VER-AGENT-VM-010` 覆盖：`REQ-AGENT-VM-010` 通过[操作运行手册](OPERATIONS.md)的拓扑与来源章节、已接受的[拓扑与恢复 ADR](../../adr/0028-agent-vm-topology-recovery-boundary.md)和 `bin/test_agent_vm_documentation.py`。
 - `VER-AGENT-VM-011` 覆盖：`REQ-AGENT-VM-011` 通过[操作运行手册](OPERATIONS.md)的恢复流程、现有原生状态核对与操作日志行为测试，以及 `bin/test_agent_vm_documentation.py`。
@@ -344,6 +354,7 @@ TypeScript/Bun 同步助手将受 Git 跟踪且未忽略的工作树文件传输
 - [Agent VM 镜像运行变体](../../adr/0051-agent-vm-image-runtime-variants.md)
 - [客户端运行与发布校验边界](../../adr/0052-client-runtime-release-boundary.md)
 - [镜像名称与单操作固定](../../adr/0053-image-names-and-operation-pinning.md)
+- [VM 保留与租约区间](../../adr/0056-agent-vm-vm-hold-and-lease-bands.md)
 
 ## 相关材料
 

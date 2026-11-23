@@ -54,3 +54,11 @@ stdout 承载正常 JSON 或命令声明的数据流；stderr 承载诊断。`ex
 协议号仍为 4。`image-list` 不接受会话、操作 ID 或写入，在 `result.images` 中返回可创建镜像，不返回管理来源字段。`acquire` 的无选择器请求保持请求语义 1；带 `image` 的请求必须声明语义 2，新控制端接受 1–2，响应保持语义 1。旧控制端的请求窗口拒绝语义 2，避免忽略新字段后错误使用默认镜像。
 
 `image` 是名称或完整指纹，控制端事务内解析并在日志 `_image_fingerprint` 固定解析结果；请求摘要保留原始选择器，重试先匹配原请求。已有会话的显式选择必须匹配原指纹。完成响应的 `result.image_fingerprint` 用于确认实际绑定。
+
+## 租约与保留请求语义
+
+协议号仍为 4。`acquire` 和 `renew` 可以携带正整数字段 `lease_seconds`；首租显式范围是 300–21600 秒，续期增加量显式范围是 1800–21600 秒，且不得超过部署配置的 `max_lease_seconds`。越界值必须在持久写入或原生影响前以 `invalid_request` 拒绝；旧控制端拒绝未知字段时，客户端不得去掉时长静默重试。带 `lease_seconds` 的 acquire 声明请求语义 3，renew 声明请求语义 2；旧控制端的请求窗口不包含这些语义，因此不能静默忽略时长。
+
+`pin` 和 `unpin` 是会话写动作，需要 `operation_id` 与 generation。`pin` 必须携带非空 `reason`（最多 512 字符），用于持久保留理由；`unpin` 的 `reason` 可选。保留只适用于 `active` 任务。pinned 时 `renew` 和 `release` 返回 `lease_pinned`，`destroy` 仍可执行；状态响应新增 `lease_state`（`effective`、`pinned`、`expired`、`absent`、`unknown`）和 `pinned` 对象，pinned 时 `effective_lease` 保持可用语义，`lease_expires_at` 保留冻结值。`unpin` 以配置首租默认时长从当前时刻重算截止时间，并按配置上限封顶。
+
+服务端必须跳过 pinned 任务的到期与维护补偿，并保留其资源预留；容量不足时拒绝新准入，不得自动取消保留。新增状态能力标记 `vm-hold@1`。

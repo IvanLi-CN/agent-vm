@@ -127,8 +127,8 @@ func Defaults() Config {
 		Slot:                               "blue",
 		Socket:                             "/run/agent-vm-native/control.sock",
 		InitialLeaseSeconds:                1800,
-		RenewSeconds:                       900,
-		MaxLeaseSeconds:                    7200,
+		RenewSeconds:                       1800,
+		MaxLeaseSeconds:                    21600,
 		CacheSeconds:                       86400,
 		CPUOvercommitRatio:                 json.Number("4"),
 		MemoryOvercommitRatio:              json.Number("4"),
@@ -266,11 +266,11 @@ func (c Config) Validate() error {
 	if start > end {
 		return errors.New("config_invalid: vm_ip_start must not exceed vm_ip_end")
 	}
-	if c.InitialLeaseSeconds <= 0 || c.RenewSeconds <= 0 || c.MaxLeaseSeconds <= 0 || c.CacheSeconds <= 0 {
-		return errors.New("config_invalid: lease and cache durations must be positive")
+	if c.InitialLeaseSeconds < 300 || c.MaxLeaseSeconds > 21600 || c.CacheSeconds <= 0 {
+		return errors.New("config_invalid: initial_lease_seconds must be at least 300 and max_lease_seconds at most 21600")
 	}
-	if c.RenewSeconds > c.MaxLeaseSeconds {
-		return errors.New("config_invalid: renew_seconds exceeds max_lease_seconds")
+	if c.InitialLeaseSeconds > c.MaxLeaseSeconds || c.RenewSeconds < 1800 || c.RenewSeconds > c.MaxLeaseSeconds {
+		return errors.New("config_invalid: renew_seconds must be between 1800 and max_lease_seconds")
 	}
 	if c.SweepSeconds <= 0 || c.WorkerTimeoutSeconds <= 0 || c.DrainTimeoutSeconds <= 0 || c.ActivationTimeoutSeconds <= 0 {
 		return errors.New("config_invalid: scheduler and timeout values must be positive")

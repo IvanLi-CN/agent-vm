@@ -37,14 +37,14 @@ OIDC callback 兼容签发方返回的单值 `iss` 与 `scope`。存在 `iss` �
 
 ## 授权与敏感操作
 
-VM 清单只有在 task 为 `active` 且租约时间有效时才能显示 `lease.state=effective`，与生命周期接口保持一致。准备中、缓存、收尾或失败记录即使保留未来到期时间，也不能据此宣称有效租约；此时保留时间并显示 `unknown`。已到期、缺失或无法解析的租约分别保留 `expired`、`absent` 或 `unknown`，不推测实例可用性。
+VM 清单只有在 task 为 `active` 且租约时间有效时才能显示 `lease.state=effective`，与生命周期接口保持一致。`active` 且存在 VM 保留时显示 `lease.state=pinned`，`expires_at` 保留冻结值且不推断租约继续延长；`pinned` 对象必须包含保留时间与必填理由。准备中、缓存、收尾或失败记录即使保留未来到期时间，也不能据此宣称有效租约；此时保留时间并显示 `unknown`。已到期、缺失或无法解析的租约分别保留 `expired`、`absent` 或 `unknown`，不推测实例可用性。
 
 唯一管理员使用浏览器会话和 [Token API](token-api.md)。API 没有普通用户或跨主体资源边界：管理员可以检查和管理配置 capability 允许的所有目标。Token 创建必须使用 UUID operation ID 和绑定准确管理员 `(issuer, subject)` 的规范重试身份。请求 `agent:operate` scope 时必须同时显式提供 `agent:read` scope；这是共同要求，不是隐式继承，使同一 Token 能在响应丢失后查询状态和 reconciliation。成功的持久 operation 状态必须暴露 `token_id`、安全元数据和一次性披露状态；成功的 `token_create` 结果不得缺少这些字段，并发或重复请求也不得再次返回明文。创建响应丢失时，管理员查询原 operation，确认并按 ID 撤销 Token，再使用新的 operation ID 创建替代 Token。`agent:observe_admin` 是显式机器 scope，不是用户角色。下方 capability 矩阵是规范性合同：管理员角色不自动包含所有操作 capability，每个 endpoint 都必须拒绝缺少对应 capability 的请求。
 
 | 浏览器 capability | 授权的管理面 | 额外授权规则 |
 | --- | --- | --- |
 | `read` | `GET /api/v1/session`；`GET /api/v1/operations` 和 `GET /api/v1/operations/{operation_id}`。 | 只有准确的管理员主体可以访问浏览器 API；operation 元数据仍受字段白名单限制。 |
-| `operate` | VM `restart`、`resize`、`release`、`destroy`、`port_add` 和 `port_remove` 的操作预览与提交。 | 重新校验目标 `target_version`、generation、lease 和状态；敏感操作仍需预览和确认。可以提供审计 reason，但不是必填项。 |
+| `operate` | VM `restart`、`resize`、`release`、`destroy`、`pin`、`unpin`、`port_add` 和 `port_remove` 的操作预览与提交。 | 重新校验目标 `target_version`、generation、lease 和状态；敏感操作仍需预览和确认。可以提供审计 reason，但 `pin` 必须提供非空理由并同时作为保留理由；保留 VM 的 `release` 被拒绝，`destroy` 必须在预览中披露保留状态。 |
 | `manage_tokens` | Token 列表、读取、创建、撤销和撤销预览 endpoint。 | Token 撤销必须使用当前 target version 和绑定预览的 confirmation token。 |
 | `manage_images` | 镜像列表、导入、上传、默认选择、退役、删除及其预览。 | 完整性、适用性、引用、target version 和确认校验都必须保留。 |
 | `maintain_system` | 系统维护预览与提交，包括 drain、reconcile 和垃圾回收。 | 发布事务和 state-write fence 仍是权威；浏览器请求不得重新开放 admission。 |

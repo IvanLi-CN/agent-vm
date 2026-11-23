@@ -38,6 +38,11 @@ const (
 	stateFailed    = "failed"
 )
 
+const (
+	minimumInitialLeaseSeconds = 300
+	minimumRenewLeaseSeconds   = 1800
+)
+
 var resourceKeys = []string{"cpu", "memory_mib", "disk_gib"}
 
 var (
@@ -66,13 +71,13 @@ func timerExpireOperationID(taskID string, generation int64) string {
 var (
 	writeActions = map[string]bool{
 		"acquire": true, "renew": true, "release": true, "destroy": true,
-		"restart": true, "resize": true, "port-add": true, "port-remove": true,
+		"restart": true, "resize": true, "port-add": true, "port-remove": true, "pin": true, "unpin": true,
 		"timer-expire": true, "drain-enter": true, "drain-exit": true, "admin-reconcile": true, "admin-reconcile-session": true, "admin-reconcile-history": true, "admin-gc": true,
 	}
 	sessionActions = map[string]bool{
 		"status": true, "acquire": true, "renew": true, "release": true,
 		"destroy": true, "restart": true, "resize": true, "ssh-info": true,
-		"port-add": true, "port-list": true, "port-remove": true, "admin-reconcile-session": true,
+		"port-add": true, "port-list": true, "port-remove": true, "pin": true, "unpin": true, "admin-reconcile-session": true,
 	}
 )
 
@@ -2499,6 +2504,10 @@ func (s *Service) dispatchAction(ctx context.Context, action string, request pro
 		return s.restart(ctx, request)
 	case "resize":
 		return s.resize(ctx, request)
+	case "pin":
+		return s.pin(ctx, request)
+	case "unpin":
+		return s.unpin(ctx, request)
 	case "port-add":
 		return s.portAdd(ctx, request)
 	case "port-list":
@@ -2547,6 +2556,8 @@ func (s *Service) status(ctx context.Context, session string) (map[string]any, e
 			"session_id":      session,
 			"generation":      int64(0),
 			"effective_lease": false,
+			"lease_state":     "absent",
+			"pinned":          nil,
 			"native_status":   stateAbsent,
 			"guest_available": false,
 		}, nil
@@ -2594,8 +2605,12 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
+	leaseSeconds, err := leaseSecondsFor(request, s.Config.InitialLeaseSeconds, minimumInitialLeaseSeconds, s.Config.MaxLeaseSeconds)
+	if err != nil {
+		return nil, err
+	}
 	now := s.Clock()
-	deadline := now.Add(time.Duration(s.Config.InitialLeaseSeconds) * time.Second)
+	deadline := now.Add(time.Duration(leaseSeconds) * time.Second)
 	created := false
 	appliedResources := zeroResources()
 	preparationPhase := "acquire-preparing"
@@ -2612,6 +2627,9 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 			return nil, protocol.NewError("generation_mismatch", "task generation does not match request", map[string]any{"expected": task.Generation, "actual": generation})
 		}
 		if task.State == stateActive && effective(task, now) {
+			if _, hasLease := request["lease_seconds"]; hasLease {
+				return nil, protocol.NewError("invalid_request", "an active lease cannot be changed by acquire; use renew", nil)
+			}
 			if requestHasResourceFields(request) {
 				current := map[string]int64{}
 				_ = json.Unmarshal([]byte(task.ResourcesJSON), &current)
@@ -2793,6 +2811,9 @@ func (s *Service) renew(ctx context.Context, request protocol.Request) (map[stri
 	} else if draining {
 		return nil, protocol.NewError("draining", "renew is refused while draining", nil)
 	}
+	if task.PinnedAt != nil {
+		return nil, protocol.NewError("lease_pinned", "VM is pinned; unpin before renewing its lease", nil)
+	}
 	if task.LeaseExpiresAt == nil {
 		return nil, protocol.NewError("lease_expired", "task has no active lease deadline", nil)
 	}
@@ -2800,20 +2821,101 @@ func (s *Service) renew(ctx context.Context, request protocol.Request) (map[stri
 	if err != nil {
 		return nil, protocol.NewError("state_unverified", "lease deadline is invalid", nil)
 	}
-	deadline := currentDeadline.Add(time.Duration(s.Config.RenewSeconds) * time.Second)
+	renewSeconds, err := leaseSecondsFor(request, s.Config.RenewSeconds, minimumRenewLeaseSeconds, s.Config.MaxLeaseSeconds)
+	if err != nil {
+		return nil, err
+	}
+	deadline := currentDeadline.Add(time.Duration(renewSeconds) * time.Second)
 	max := s.Clock().Add(time.Duration(s.Config.MaxLeaseSeconds) * time.Second)
 	if deadline.After(max) {
 		deadline = max
 	}
 	now := s.Clock()
-	updated, err := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &now}, map[string]any{"lease_expires_at": nowString(deadline), "updated_at": nowString(now)})
+	updated, err := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &now, NoHold: true}, map[string]any{"lease_expires_at": nowString(deadline), "updated_at": nowString(now)})
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
 	if !updated {
+		current, readErr := s.Store.GetTask(ctx, map[string]any{"task_id": task.TaskID})
+		if readErr != nil {
+			return nil, s.sqliteError(readErr)
+		}
+		if current != nil && current.PinnedAt != nil {
+			return nil, protocol.NewError("lease_pinned", "VM is pinned; unpin before renewing its lease", nil)
+		}
 		return nil, protocol.NewError("lease_expired", "session lease is not effective", map[string]any{"outcome_verified": true})
 	}
 	task.LeaseExpiresAt = stringPointer(nowString(deadline))
+	return s.summary(ctx, task)
+}
+
+func (s *Service) pin(ctx context.Context, request protocol.Request) (map[string]any, error) {
+	task, err := s.task(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	if task.State != stateActive {
+		return nil, protocol.NewError("task_not_active", "only an active VM can be pinned", map[string]any{"state": task.State})
+	}
+	if task.PinnedAt != nil {
+		return nil, protocol.NewError("already_pinned", "VM is already pinned", map[string]any{"pinned_at": *task.PinnedAt, "pin_reason": task.PinReason})
+	}
+	reason := stringValue(request["reason"])
+	now := s.Clock()
+	updated := false
+	err = s.commitMutationContext(ctx, func() error {
+		var commitErr error
+		updated, commitErr = s.Store.PinTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}}, nowString(now), reason)
+		return commitErr
+	})
+	if err != nil {
+		return nil, s.sqliteError(err)
+	}
+	if !updated {
+		current, readErr := s.Store.GetTask(ctx, map[string]any{"task_id": task.TaskID})
+		if readErr != nil {
+			return nil, s.sqliteError(readErr)
+		}
+		if current != nil && current.PinnedAt != nil {
+			return nil, protocol.NewError("already_pinned", "VM is already pinned", nil)
+		}
+		return nil, protocol.NewError("task_transition", "VM changed before pin could be committed", map[string]any{"outcome_verified": true})
+	}
+	task.PinnedAt, task.PinReason = stringPointer(nowString(now)), stringPointer(reason)
+	return s.summary(ctx, task)
+}
+
+func (s *Service) unpin(ctx context.Context, request protocol.Request) (map[string]any, error) {
+	task, err := s.task(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	if task.State != stateActive {
+		return nil, protocol.NewError("task_not_active", "only an active VM can be unpinned", map[string]any{"state": task.State})
+	}
+	if task.PinnedAt == nil {
+		return nil, protocol.NewError("not_pinned", "VM is not pinned", nil)
+	}
+	now := s.Clock()
+	deadline := now.Add(time.Duration(s.Config.InitialLeaseSeconds) * time.Second)
+	if maximum := now.Add(time.Duration(s.Config.MaxLeaseSeconds) * time.Second); deadline.After(maximum) {
+		deadline = maximum
+	}
+	updated := false
+	err = s.commitMutationContext(ctx, func() error {
+		var commitErr error
+		updated, commitErr = s.Store.UnpinTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}}, nowString(deadline), nowString(now))
+		return commitErr
+	})
+	if err != nil {
+		return nil, s.sqliteError(err)
+	}
+	if !updated {
+		return nil, protocol.NewError("not_pinned", "VM hold changed before unpin could be committed", map[string]any{"outcome_verified": true})
+	}
+	task.PinnedAt, task.PinReason = nil, nil
+	task.LeaseExpiresAt = stringPointer(nowString(deadline))
+	task.UpdatedAt = nowString(now)
 	return s.summary(ctx, task)
 }
 
@@ -2834,6 +2936,9 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	task, err := s.task(ctx, request)
 	if err != nil {
 		return nil, err
+	}
+	if task.PinnedAt != nil && !destroy {
+		return nil, protocol.NewError("lease_pinned", "VM is pinned; unpin before releasing it", nil)
 	}
 	if destroy {
 		if err := s.cancelPendingAcquireOperations(ctx, task); err != nil {
@@ -2857,11 +2962,18 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 		if destroy {
 			targetState = stateDeleting
 		}
-		updated, updateErr := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{task.State}}, map[string]any{"state": targetState, "lease_expires_at": nil, "updated_at": nowString(s.Clock())})
+		updated, updateErr := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{task.State}, NoHold: !destroy}, map[string]any{"state": targetState, "lease_expires_at": nil, "updated_at": nowString(s.Clock())})
 		if updateErr != nil {
 			return nil, s.sqliteError(updateErr)
 		}
 		if !updated {
+			current, readErr := s.Store.GetTask(ctx, map[string]any{"task_id": task.TaskID})
+			if readErr != nil {
+				return nil, s.sqliteError(readErr)
+			}
+			if !destroy && current != nil && current.PinnedAt != nil {
+				return nil, protocol.NewError("lease_pinned", "VM is pinned; unpin before releasing it", nil)
+			}
 			return nil, protocol.NewError("task_transition", "session changed before cleanup started", map[string]any{"outcome_verified": false})
 		}
 		task.State = targetState
@@ -4764,6 +4876,9 @@ func (s *Service) expire(ctx context.Context, request protocol.Request) (map[str
 	if task == nil {
 		return map[string]any{"expired": false}, nil
 	}
+	if task.PinnedAt != nil {
+		return map[string]any{"expired": false, "pinned": true}, nil
+	}
 	generation := intValue(request["generation"])
 	if generation != task.Generation {
 		return map[string]any{"expired": false, "stale": true}, nil
@@ -4853,7 +4968,7 @@ func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any
 		if task != nil {
 			session = task.SessionID
 		}
-		return map[string]any{"state": stateAbsent, "session_id": session, "effective_lease": false, "native_status": stateAbsent, "guest_available": false, "verified": true}, nil
+		return map[string]any{"state": stateAbsent, "session_id": session, "effective_lease": false, "lease_state": "absent", "pinned": nil, "native_status": stateAbsent, "guest_available": false, "verified": true}, nil
 	}
 	var resources any
 	var reservation any
@@ -4890,7 +5005,7 @@ func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any
 	if pendingErr != nil {
 		return nil, s.sqliteError(pendingErr)
 	}
-	result := map[string]any{"image_fingerprint": task.ImageFingerprint, "task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock()), "native_status": "unverified", "guest_available": nil, "verified": false, "pending_operation_count": len(pendingOperations), "pending_operations_complete": !morePending}
+	result := map[string]any{"image_fingerprint": task.ImageFingerprint, "task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "lease_state": leaseState(task, s.Clock()), "pinned": pinnedSummary(task), "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock()), "native_status": "unverified", "guest_available": nil, "verified": false, "pending_operation_count": len(pendingOperations), "pending_operations_complete": !morePending}
 	if resourceState != nil {
 		result["resource_state"] = resourceState
 	}
@@ -6153,10 +6268,65 @@ func taskID(session string) string {
 	return "avm-" + hex.EncodeToString(sum[:])[:16]
 }
 func effective(task *state.Task, now time.Time) bool {
-	return task != nil && task.State == stateActive && task.LeaseExpiresAt != nil && func() bool {
+	if task == nil || task.State != stateActive {
+		return false
+	}
+	if task.PinnedAt != nil {
+		return true
+	}
+	return task.LeaseExpiresAt != nil && func() bool {
 		parsed, err := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt)
 		return err == nil && parsed.After(now)
 	}()
+}
+
+func leaseState(task *state.Task, now time.Time) string {
+	if task == nil {
+		return "absent"
+	}
+	if task.PinnedAt != nil {
+		return "pinned"
+	}
+	if task.LeaseExpiresAt == nil {
+		return "absent"
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt)
+	if err != nil {
+		return "unknown"
+	}
+	if !parsed.After(now) {
+		return "expired"
+	}
+	if task.State == stateActive {
+		return "effective"
+	}
+	return "unknown"
+}
+
+func pinnedSummary(task *state.Task) any {
+	if task == nil || task.PinnedAt == nil {
+		return nil
+	}
+	reason := ""
+	if task.PinReason != nil {
+		reason = *task.PinReason
+	}
+	return map[string]any{"pinned_at": *task.PinnedAt, "reason": reason}
+}
+
+func leaseSecondsFor(request protocol.Request, defaultSeconds, minimum, maximum int64) (int64, error) {
+	seconds := defaultSeconds
+	if seconds < minimum || seconds > maximum {
+		return 0, protocol.NewError("config_invalid", "configured lease duration is outside the supported range", nil)
+	}
+	if raw, present := request["lease_seconds"]; present {
+		parsed, valid := protocol.Integer(raw)
+		if !valid || parsed < minimum || parsed > maximum {
+			return 0, protocol.NewError("invalid_request", "lease_seconds is outside the supported range", map[string]any{"minimum_seconds": minimum, "maximum_seconds": maximum})
+		}
+		seconds = parsed
+	}
+	return seconds, nil
 }
 func nowString(value time.Time) string {
 	text := value.UTC().Format(time.RFC3339Nano)
@@ -6225,7 +6395,7 @@ func uncertain(err error) bool {
 	switch control.Code {
 	case "acquire_partial", "resize_partial", "restart_partial", "cleanup_incomplete", "operation_unverified", "native_failed":
 		return true
-	case "invalid_request", "missing_session", "generation_mismatch", "lease_expired", "draining", "maintenance_unhealthy", "permission_denied", "cache_stale", "task_missing", "task_not_active", "resource_pressure", "resource_insufficient", "resource_unverified", "watermarks_unreachable":
+	case "invalid_request", "missing_session", "generation_mismatch", "lease_expired", "lease_pinned", "already_pinned", "not_pinned", "draining", "maintenance_unhealthy", "permission_denied", "cache_stale", "task_missing", "task_not_active", "resource_pressure", "resource_insufficient", "resource_unverified", "watermarks_unreachable":
 		return false
 	default:
 		return true

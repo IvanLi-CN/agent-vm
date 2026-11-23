@@ -19,7 +19,7 @@ The service resolves the Token's validation digest, checks expiry and revocation
 | Token scope | Protocol-4 actions authorized by that scope |
 | --- | --- |
 | `agent:read` | `doctor`, `status`, `port-list` |
-| `agent:operate` (issued with explicit `agent:read`) | `acquire`, `renew`, `release`, `destroy`, `restart`, `resize`, `port-add`, `port-remove` |
+| `agent:operate` (issued with explicit `agent:read`) | `acquire`, `renew`, `release`, `destroy`, `restart`, `resize`, `pin`, `unpin`, `port-add`, `port-remove` |
 | `agent:sync` | `ssh-info` only, to obtain the session's bounded SSH/source-transfer connection data; it does not authorize arbitrary SSH commands, `exec`, file transfer or export by itself. |
 | `agent:observe_admin` | Read-only `admin-metrics`, `admin-status`, `admin-session-list` and `drain-status`; the scope itself is the explicit machine authorization for these observations. |
 

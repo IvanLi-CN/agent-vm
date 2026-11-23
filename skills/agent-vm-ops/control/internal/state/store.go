@@ -22,6 +22,13 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const taskHoldSchema = `CREATE TABLE IF NOT EXISTS task_holds (
+  task_id TEXT PRIMARY KEY,
+  pinned_at TEXT NOT NULL,
+  pin_reason TEXT NOT NULL,
+  FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+);`
+
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -47,6 +54,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   previous_generation INTEGER,
   resource_reservation_json TEXT NOT NULL DEFAULT '{}'
 );
+` + taskHoldSchema + `
 CREATE TABLE IF NOT EXISTS ports (
   task_id TEXT NOT NULL,
   generation INTEGER NOT NULL,
@@ -157,6 +165,17 @@ type Task struct {
 	ReservationBytes        int64
 	PreviousGeneration      *int64
 	ResourceReservationJSON string
+	// PinnedAt and PinReason are joined from task_holds for lifecycle and
+	// management reads; they are not columns on tasks.
+	PinnedAt  *string
+	PinReason *string
+}
+
+// TaskHold is the current explicit VM hold for one active task.
+type TaskHold struct {
+	TaskID    string
+	PinnedAt  string
+	PinReason string
 }
 
 // TaskPageFilter describes the bounded, browser-facing task inventory query.
@@ -261,6 +280,7 @@ type TaskCondition struct {
 	States           []string
 	LeaseActiveAfter *time.Time
 	LeaseExpiredAt   *time.Time
+	NoHold           bool
 }
 
 func Open(path string, allowCreate bool) (*Store, error) {
@@ -311,6 +331,10 @@ func Open(path string, allowCreate bool) (*Store, error) {
 		store.Close()
 		return nil, err
 	} else if err := store.ensureStateEpoch(context.Background()); err != nil {
+		store.Close()
+		return nil, err
+	}
+	if err := store.EnsureTaskHoldSchema(context.Background()); err != nil {
 		store.Close()
 		return nil, err
 	}
@@ -728,6 +752,14 @@ func (s *Store) GetTask(ctx context.Context, lookup map[string]any) (*Task, erro
 		}
 		return err
 	})
+	if err == nil && task != nil {
+		if hold, holdErr := s.GetTaskHold(ctx, task.TaskID); holdErr != nil {
+			return nil, holdErr
+		} else if hold != nil {
+			pinnedAt, reason := hold.PinnedAt, hold.PinReason
+			task.PinnedAt, task.PinReason = &pinnedAt, &reason
+		}
+	}
 	return task, err
 }
 
@@ -748,6 +780,9 @@ func (s *Store) ListTasks(ctx context.Context) ([]Task, error) {
 		}
 		return rows.Err()
 	})
+	if err == nil && len(tasks) > 0 {
+		err = s.attachTaskHolds(ctx, tasks)
+	}
 	return tasks, err
 }
 
@@ -783,15 +818,17 @@ func (s *Store) ListTasksPage(ctx context.Context, filter TaskPageFilter) ([]Tas
 	if filter.LeaseState != "" {
 		switch filter.LeaseState {
 		case "effective":
-			conditions = append(conditions, "lease_expires_at IS NOT NULL AND lease_expires_at > ?")
+			conditions = append(conditions, "lease_expires_at IS NOT NULL AND lease_expires_at > ? AND NOT EXISTS (SELECT 1 FROM task_holds h WHERE h.task_id = tasks.task_id)")
 			args = append(args, filter.LeaseNow)
 		case "expired":
-			conditions = append(conditions, "lease_expires_at IS NOT NULL AND lease_expires_at <= ?")
+			conditions = append(conditions, "lease_expires_at IS NOT NULL AND lease_expires_at <= ? AND NOT EXISTS (SELECT 1 FROM task_holds h WHERE h.task_id = tasks.task_id)")
 			args = append(args, filter.LeaseNow)
 		case "absent":
-			conditions = append(conditions, "lease_expires_at IS NULL")
+			conditions = append(conditions, "lease_expires_at IS NULL AND NOT EXISTS (SELECT 1 FROM task_holds h WHERE h.task_id = tasks.task_id)")
 		case "unknown":
-			conditions = append(conditions, "lease_expires_at IS NOT NULL AND (length(lease_expires_at) < 20 OR lease_expires_at NOT LIKE '____-__-__T%')")
+			conditions = append(conditions, "lease_expires_at IS NOT NULL AND (length(lease_expires_at) < 20 OR lease_expires_at NOT LIKE '____-__-__T%') AND NOT EXISTS (SELECT 1 FROM task_holds h WHERE h.task_id = tasks.task_id)")
+		case "pinned":
+			conditions = append(conditions, "EXISTS (SELECT 1 FROM task_holds h WHERE h.task_id = tasks.task_id)")
 		}
 	}
 	if filter.AfterTaskID != "" {
@@ -822,6 +859,11 @@ func (s *Store) ListTasksPage(ctx context.Context, filter TaskPageFilter) ([]Tas
 	})
 	if err != nil {
 		return nil, false, err
+	}
+	if len(values) > 0 {
+		if err := s.attachTaskHolds(ctx, values); err != nil {
+			return nil, false, err
+		}
 	}
 	hasMore := len(values) > limit
 	if hasMore {
@@ -857,6 +899,147 @@ func nullableInt(value sql.NullInt64) *int64 {
 		return nil
 	}
 	return &value.Int64
+}
+
+// EnsureTaskHoldSchema creates the additive task_holds table. Older core
+// databases intentionally open before this table exists so a release rollout
+// can add holds without rewriting the canonical tasks schema.
+func (s *Store) EnsureTaskHoldSchema(ctx context.Context) error {
+	if s.remote != nil {
+		return s.remote.ensureTaskHoldSchema(ctx)
+	}
+	return s.withWrite(ctx, func(tx *Tx) error {
+		if _, err := tx.conn.ExecContext(ctx, taskHoldSchema); err != nil {
+			return err
+		}
+		// Schema repair is not a business mutation and must not rotate the
+		// observation epoch.
+		tx.changed = false
+		tx.authChanged = false
+		return nil
+	})
+}
+
+func (s *Store) GetTaskHold(ctx context.Context, taskID string) (*TaskHold, error) {
+	var hold *TaskHold
+	err := s.withRead(ctx, func(conn *sql.Conn) error {
+		var value TaskHold
+		err := conn.QueryRowContext(ctx, "SELECT task_id, pinned_at, pin_reason FROM task_holds WHERE task_id = ?", taskID).Scan(&value.TaskID, &value.PinnedAt, &value.PinReason)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err == nil {
+			hold = &value
+		}
+		return err
+	})
+	return hold, err
+}
+
+func (s *Store) ListTaskHolds(ctx context.Context) (map[string]TaskHold, error) {
+	values := map[string]TaskHold{}
+	err := s.withRead(ctx, func(conn *sql.Conn) error {
+		rows, err := conn.QueryContext(ctx, "SELECT task_id, pinned_at, pin_reason FROM task_holds")
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var value TaskHold
+			if err := rows.Scan(&value.TaskID, &value.PinnedAt, &value.PinReason); err != nil {
+				return err
+			}
+			values[value.TaskID] = value
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+func (s *Store) attachTaskHolds(ctx context.Context, tasks []Task) error {
+	holds, err := s.ListTaskHolds(ctx)
+	if err != nil {
+		return err
+	}
+	for index := range tasks {
+		if hold, ok := holds[tasks[index].TaskID]; ok {
+			pinnedAt, reason := hold.PinnedAt, hold.PinReason
+			tasks[index].PinnedAt, tasks[index].PinReason = &pinnedAt, &reason
+		}
+	}
+	return nil
+}
+
+// PinTaskIf records a hold and advances the task resource version atomically.
+// It returns false when the task no longer matches the supplied condition or
+// was already pinned.
+func (s *Store) PinTaskIf(ctx context.Context, taskID string, condition TaskCondition, pinnedAt, reason string) (bool, error) {
+	changed := false
+	err := s.withWrite(ctx, func(tx *Tx) error {
+		changed = false
+		matched, err := taskConditionMatches(ctx, tx, taskID, condition)
+		if err != nil || !matched {
+			return err
+		}
+		var current string
+		err = tx.conn.QueryRowContext(ctx, "SELECT pinned_at FROM task_holds WHERE task_id = ?", taskID).Scan(&current)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if _, err := tx.exec("INSERT INTO task_holds(task_id, pinned_at, pin_reason) VALUES(?, ?, ?)", taskID, pinnedAt, reason); err != nil {
+			return err
+		}
+		if _, err := tx.exec("UPDATE tasks SET updated_at = ? WHERE task_id = ?", pinnedAt, taskID); err != nil {
+			return err
+		}
+		changed = true
+		return nil
+	})
+	return changed, err
+}
+
+// UnpinTaskIf clears the hold and installs the recomputed lease deadline in
+// one transaction. It returns false when the task no longer matches or has no
+// current hold.
+func (s *Store) UnpinTaskIf(ctx context.Context, taskID string, condition TaskCondition, leaseExpiresAt, updatedAt string) (bool, error) {
+	changed := false
+	err := s.withWrite(ctx, func(tx *Tx) error {
+		changed = false
+		matched, err := taskConditionMatches(ctx, tx, taskID, condition)
+		if err != nil || !matched {
+			return err
+		}
+		result, err := tx.exec("DELETE FROM task_holds WHERE task_id = ?", taskID)
+		if err != nil {
+			return err
+		}
+		rows, rowsErr := result.RowsAffected()
+		if rowsErr != nil {
+			return rowsErr
+		}
+		if rows == 0 {
+			return nil
+		}
+		if _, err := tx.exec("UPDATE tasks SET lease_expires_at = ?, updated_at = ? WHERE task_id = ?", leaseExpiresAt, updatedAt, taskID); err != nil {
+			return err
+		}
+		changed = true
+		return nil
+	})
+	return changed, err
+}
+
+func (s *Store) DeleteTaskHold(ctx context.Context, taskID string) error {
+	return s.withWrite(ctx, func(tx *Tx) error {
+		_, err := tx.exec("DELETE FROM task_holds WHERE task_id = ?", taskID)
+		return err
+	})
 }
 
 func (s *Store) InsertTask(ctx context.Context, task Task) error {
@@ -972,6 +1155,9 @@ func (s *Store) DeleteTask(ctx context.Context, taskID string) error {
 		if err != nil {
 			return err
 		}
+		if _, err := tx.exec("DELETE FROM task_holds WHERE task_id = ?", taskID); err != nil {
+			return err
+		}
 		if _, err := tx.exec("DELETE FROM tasks WHERE task_id = ?", taskID); err != nil {
 			return err
 		}
@@ -1001,6 +1187,9 @@ func (s *Store) DeleteTaskIf(ctx context.Context, taskID string, condition TaskC
 		}
 		if !matched {
 			return nil
+		}
+		if _, err := tx.exec("DELETE FROM task_holds WHERE task_id = ?", taskID); err != nil {
+			return err
 		}
 		result, err := tx.exec("DELETE FROM tasks WHERE task_id = ?", taskID)
 		if err != nil {
@@ -1538,7 +1727,8 @@ func taskConditionMatches(ctx context.Context, tx *Tx, taskID string, condition 
 	var generation int64
 	var state string
 	var lease sql.NullString
-	err := tx.conn.QueryRowContext(ctx, "SELECT generation, state, lease_expires_at FROM tasks WHERE task_id = ?", taskID).Scan(&generation, &state, &lease)
+	var held int
+	err := tx.conn.QueryRowContext(ctx, "SELECT generation, state, lease_expires_at, EXISTS(SELECT 1 FROM task_holds h WHERE h.task_id = tasks.task_id) FROM tasks WHERE task_id = ?", taskID).Scan(&generation, &state, &lease, &held)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -1580,6 +1770,9 @@ func taskConditionMatches(ctx context.Context, tx *Tx, taskID string, condition 
 		if expires.After(*condition.LeaseExpiredAt) {
 			return false, nil
 		}
+	}
+	if condition.NoHold && held == 1 {
+		return false, nil
 	}
 	return true, nil
 }

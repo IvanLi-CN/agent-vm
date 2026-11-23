@@ -363,6 +363,136 @@ func TestLeaseJournalAndBuiltInCleanup(t *testing.T) {
 	}
 }
 
+func leaseDeadline(result map[string]any) string {
+	if value, ok := result["lease_expires_at"].(*string); ok && value != nil {
+		return *value
+	}
+	return ""
+}
+
+func TestVMPinProtectsLeaseAndUnpinRecomputesDeadline(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.ImageFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	service := New(store, cfg, Options{Clock: func() time.Time { return now }})
+	ctx := context.Background()
+	acquire := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "hold-demo", "generation": int64(0), "operation_id": "hold-acquire", "lease_seconds": int64(300)}
+	first, err := service.Dispatch(ctx, acquire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := first["result"].(map[string]any)
+	if result["lease_state"] != "effective" || leaseDeadline(result) != nowString(now.Add(5*time.Minute)) {
+		t.Fatalf("acquire result = %#v", result)
+	}
+	pin := protocol.Request{"protocol": protocol.Version, "action": "pin", "session_id": "hold-demo", "generation": int64(1), "operation_id": "hold-pin", "reason": "awaiting owner review"}
+	pinned, err := service.Dispatch(ctx, pin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedResult := pinned["result"].(map[string]any)
+	if pinnedResult["lease_state"] != "pinned" || pinnedResult["effective_lease"] != true {
+		t.Fatalf("pin result = %#v", pinnedResult)
+	}
+	pinnedValue, ok := pinnedResult["pinned"].(map[string]any)
+	if !ok || pinnedValue["reason"] != "awaiting owner review" {
+		t.Fatalf("pinned value = %#v", pinnedResult["pinned"])
+	}
+	frozen := leaseDeadline(pinnedResult)
+	now = now.Add(10 * time.Minute)
+	status, err := service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "status", "session_id": "hold-demo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusResult := status["result"].(map[string]any)
+	if statusResult["state"] != stateActive || statusResult["lease_state"] != "pinned" || leaseDeadline(statusResult) != frozen {
+		t.Fatalf("pinned status after frozen expiry = %#v", statusResult)
+	}
+	if _, err := service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "renew", "session_id": "hold-demo", "generation": int64(1), "operation_id": "hold-renew"}); protocol.AsError(err).Code != "lease_pinned" {
+		t.Fatalf("renew while pinned error = %v", err)
+	}
+	if _, err := service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "release", "session_id": "hold-demo", "generation": int64(1), "operation_id": "hold-release"}); protocol.AsError(err).Code != "lease_pinned" {
+		t.Fatalf("release while pinned error = %v", err)
+	}
+	unpin := protocol.Request{"protocol": protocol.Version, "action": "unpin", "session_id": "hold-demo", "generation": int64(1), "operation_id": "hold-unpin"}
+	unpinned, err := service.Dispatch(ctx, unpin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unpinnedResult := unpinned["result"].(map[string]any)
+	if unpinnedResult["lease_state"] != "effective" || unpinnedResult["pinned"] != nil || leaseDeadline(unpinnedResult) != nowString(now.Add(time.Duration(cfg.InitialLeaseSeconds)*time.Second)) {
+		t.Fatalf("unpin result = %#v", unpinnedResult)
+	}
+	now = now.Add(-10 * time.Minute)
+	pinAgain := protocol.Request{"protocol": protocol.Version, "action": "pin", "session_id": "hold-demo", "generation": int64(1), "operation_id": "hold-pin-again", "reason": "destroy warning"}
+	if _, err := service.Dispatch(ctx, pinAgain); err != nil {
+		t.Fatal(err)
+	}
+	destroy, err := service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": "hold-demo", "generation": int64(1), "operation_id": "hold-destroy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if destroy["result"].(map[string]any)["state"] != stateAbsent {
+		t.Fatalf("destroy pinned result = %#v", destroy)
+	}
+	if hold, err := store.GetTaskHold(context.Background(), taskID("hold-demo")); err != nil || hold != nil {
+		t.Fatalf("hold after destroy = %#v, err = %v", hold, err)
+	}
+}
+
+func TestLeaseDurationBounds(t *testing.T) {
+
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.ImageFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	service := New(store, cfg, Options{Clock: func() time.Time { return now }})
+	ctx := context.Background()
+	for index, test := range []struct {
+		session string
+		lease   int64
+		code    string
+	}{
+		{session: "lease-low", lease: 299, code: "invalid_request"},
+		{session: "lease-high", lease: 21601, code: "invalid_request"},
+		{session: "lease-min", lease: 300},
+		{session: "lease-max", lease: 21600},
+	} {
+		request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": test.session, "generation": int64(0), "operation_id": fmt.Sprintf("lease-bound-%d", index), "lease_seconds": test.lease}
+		_, err := service.Dispatch(ctx, request)
+		code := ""
+		if err != nil {
+			code = protocol.AsError(err).Code
+		}
+		if code != test.code {
+			t.Fatalf("acquire %s lease=%d error = %q, want %q", test.session, test.lease, code, test.code)
+		}
+	}
+	renew := protocol.Request{"protocol": protocol.Version, "action": "renew", "session_id": "lease-min", "generation": int64(1), "operation_id": "renew-low", "lease_seconds": int64(1799)}
+	if _, err := service.Dispatch(ctx, renew); protocol.AsError(err).Code != "invalid_request" {
+		t.Fatalf("renew below minimum error = %v", err)
+	}
+	renew["operation_id"], renew["lease_seconds"] = "renew-max", int64(21600)
+	response, err := service.Dispatch(ctx, renew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leaseDeadline(response["result"].(map[string]any)) != nowString(now.Add(21600*time.Second)) {
+		t.Fatalf("renew cap result = %#v", response)
+	}
+}
+
 func TestAcquirePersistsPhysicalReservationWhilePreparing(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -2687,6 +2817,7 @@ func TestDrainStatusIncludesStateCapabilities(t *testing.T) {
 		"principal-identity@1",
 		"session-image-binding@1",
 		"token-revocation@1",
+		"vm-hold@1",
 	}
 	if !reflect.DeepEqual(capabilities, expected) {
 		t.Fatalf("state capabilities = %#v, want %#v", capabilities, expected)

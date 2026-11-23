@@ -153,7 +153,7 @@ func (server *UnifiedServer) agentToken(request *http.Request) (*state.AgentToke
 
 func agentTokenAllows(scopes []string, action string) bool {
 	readOnly := map[string]bool{"doctor": true, "status": true, "port-list": true, "image-list": true}
-	operate := map[string]bool{"acquire": true, "renew": true, "release": true, "destroy": true, "restart": true, "resize": true, "port-add": true, "port-remove": true}
+	operate := map[string]bool{"acquire": true, "renew": true, "release": true, "destroy": true, "restart": true, "resize": true, "pin": true, "unpin": true, "port-add": true, "port-remove": true}
 	adminObserve := map[string]bool{"admin-metrics": true, "admin-status": true, "admin-session-list": true, "drain-status": true}
 	for _, scope := range scopes {
 		switch {
@@ -251,7 +251,7 @@ func agentErrorStatus(code string) int {
 			return http.StatusRequestEntityTooLarge
 		}
 		return http.StatusBadRequest
-	case "image_conflict", "image_unavailable", "operation_conflict", "operation_incomplete", "stale_target", "generation_mismatch", "lease_expired", "lease_released", "task_missing", "task_not_active", "task_transition", "draining", "resource_insufficient", "cache_ineligible":
+	case "image_conflict", "image_unavailable", "operation_conflict", "operation_incomplete", "stale_target", "generation_mismatch", "lease_expired", "lease_pinned", "already_pinned", "not_pinned", "lease_released", "task_missing", "task_not_active", "task_transition", "draining", "resource_insufficient", "cache_ineligible":
 		return http.StatusConflict
 	case "state_unavailable", "operation_outcome_unknown", "operation_unverified", "startup_reconcile_required", "acquire_partial", "restart_partial", "resize_partial", "cleanup_incomplete", "mapping_unverified", "network_unverified", "guest_ip_mismatch", "native_unavailable", "state_unverified", "sqlite_unavailable", "observation_unavailable", "resource_unverified", "resource_pressure", "ownership_mismatch", "guest_host_key_missing", "vm_ip_unverified":
 		return http.StatusServiceUnavailable

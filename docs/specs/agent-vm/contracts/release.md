@@ -69,6 +69,7 @@ State backend 的 `state_capabilities` registry 存储 versioned durable-state m
 | `oidc-return-path@1` | One-time OIDC transactions retain only an allowlisted same-origin return path until callback consumption. |
 | `principal-identity@1` | The configured OIDC issuer/subject is the sole administrator actor; claims and historical user mappings are never guessed. |
 | `token-revocation@1` | Opaque machine-Token digest, resource version, scope, expiry and revocation state are durable across slots. |
+| `vm-hold@1` | Durable per-task VM hold with a required reason, frozen lease evidence and additive `task_holds` state. |
 
 Format-4 manifest 声明：
 
@@ -81,7 +82,8 @@ Format-4 manifest 声明：
     "oidc-return-path@1",
     "principal-identity@1",
     "session-image-binding@1",
-    "token-revocation@1"
+    "token-revocation@1",
+    "vm-hold@1"
   ],
   "writes": [
     "legacy-agent-vm-core@1",
@@ -90,7 +92,8 @@ Format-4 manifest 声明：
     "oidc-return-path@1",
     "principal-identity@1",
     "session-image-binding@1",
-    "token-revocation@1"
+    "token-revocation@1",
+    "vm-hold@1"
   ]
 }
 ```
@@ -99,7 +102,7 @@ Format-4 manifest 声明：
 
 Installer 在改变 active pointers 或启动 services 前执行 candidate package 的 preflight check。 Rollback preflight 对 rollback target 执行同样的 comparison。 Compatible rollback 恢复完整的 earlier product package，并继续使用同一 database。 Incompatible target 必须在 activation 或 service start 前拒绝； current package 保持 selected，admission 保持 drained，等待 operator recovery。 Installer 绝不丢弃 capability markers、downgrade schema、recreate database，或让 older process 针对其无法 read/write 的 state 启动。 Post-migration health failure 不能绕过该 check。
 
-客户端运行时不读取发布 sidecar，也不校验自身源文件摘要。sidecar 属于发布及安装完整性校验材料：校验工具验证身份、固定文件集合、路径、权限和摘要，损坏或缺失材料不得通过完整包安装；明确的安装中断标记仍在远端请求前阻断客户端。未知来源的客户端使用 `legacy-protocol-4` 互操作标识并发送源码中的完整兼容能力，不伪造发布身份；该标识不表示客户端过旧，兼容窗口通过时不会产生版本差异警告。兼容窗口不匹配仍须拒绝请求；正式发布身份不同的兼容请求可返回版本警告，写操作重放保留服务端提供的警告。保留的 Bun 和 Go 清单读取入口接受完整的历史 25 动作集合或当前 26 动作集合，逐项保留输入声明的窗口，不向旧清单补充镜像能力。
+客户端运行时不读取发布 sidecar，也不校验自身源文件摘要。sidecar 属于发布及安装完整性校验材料：校验工具验证身份、固定文件集合、路径、权限和摘要，损坏或缺失材料不得通过完整包安装；明确的安装中断标记仍在远端请求前阻断客户端。未知来源的客户端使用 `legacy-protocol-4` 互操作标识并发送源码中的完整兼容能力，不伪造发布身份；该标识不表示客户端过旧，兼容窗口通过时不会产生版本差异警告。兼容窗口不匹配仍须拒绝请求；正式发布身份不同的兼容请求可返回版本警告，写操作重放保留服务端提供的警告。保留的 Bun 和 Go 清单读取入口接受缺少 `image-list`、缺少 `pin`/`unpin` 或同时缺少两者的完整历史动作集合，逐项保留输入声明的窗口，不向旧清单补充新能力。
 
 ### SQLite 到 rqlite 迁移
 

@@ -114,6 +114,7 @@
 - `docs/adr/0053-image-names-and-operation-pinning.md`
 - `docs/adr/0054-agent-vm-deployment-input-and-recovery-policy.md`
 - [root SSH 请求身份](adr/0055-root-ssh-request-identity.md)：已接受的安全边界决定，通过本索引阅读，未作为独立站点导航。
+- [VM 保留与租约区间](adr/0056-agent-vm-vm-hold-and-lease-bands.md)：已接受的生命周期与准入决定，定义保留状态、动作矩阵、租约区间和受保护销毁确认。
 
 ### 提案：索引访问
 

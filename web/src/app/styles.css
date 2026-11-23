@@ -208,6 +208,7 @@ svg { flex: none; }
 .pagination .ui-button { min-width: 32px; padding: 0 8px; }
 .detail-rail { position: sticky; top: 16px; min-width: 0; padding: 20px; }
 .detail-identity { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.badge-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .detail-identity h2 { margin-top: 2px; font-size: 18px; }
 .detail-identity .mono { display: block; margin-top: 3px; color: var(--muted); overflow-wrap: anywhere; }
 .identity-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 16px; padding: 8px 10px; background: var(--raised); border: 1px solid var(--rule); border-radius: 6px; }

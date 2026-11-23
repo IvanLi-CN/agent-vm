@@ -271,6 +271,7 @@ func (s *Store) ensureManagementBaseSchema(ctx context.Context) error {
 			{name: "oidc-return-path", version: 1},
 			{name: "principal-identity", version: 1},
 			{name: "token-revocation", version: 1},
+			{name: "vm-hold", version: 1},
 		} {
 			if _, err := tx.exec("INSERT OR IGNORE INTO state_capabilities(name, version, created_at) VALUES(?, ?, ?)", marker.name, marker.version, now); err != nil {
 				return fmt.Errorf("record state capability: %w", err)

@@ -53,7 +53,7 @@ export interface TokenRevokePreview {
 export type ObservationState = "available" | "stale" | "missing" | "failed" | "unverified";
 export type PublicServiceState = "available" | "degraded" | "unknown";
 export type VMState = "preparing" | "active" | "cached" | "closing" | "deleting" | "failed" | "absent";
-export type LeaseState = "effective" | "expired" | "absent" | "unknown";
+export type LeaseState = "effective" | "expired" | "absent" | "unknown" | "pinned";
 
 export interface PublicStatus {
   state: PublicServiceState;
@@ -122,10 +122,11 @@ export interface ManagedVM {
   image: { fingerprint: string; version_label: string | null };
   resources: { cpu_vcpu: number | null; memory_bytes: string | null; disk_bytes: string | null };
   lease: { state: LeaseState; expires_at: string | null };
+  pinned: { pinned_at: string; reason: string } | null;
   port_mappings: Array<{ name: string; protocol: "tcp" | "udp"; host_port: number; guest_port: number }>;
   last_error: SafeError | null;
   updated_at: string;
-  allowed_actions: Array<"restart" | "resize" | "release" | "destroy" | "port_add" | "port_remove">;
+  allowed_actions: Array<"restart" | "resize" | "release" | "destroy" | "pin" | "unpin" | "port_add" | "port_remove">;
 }
 
 export interface ImageReferenceCounts {
@@ -159,7 +160,7 @@ export interface ManagedImage {
 
 export type OperationStatus = "awaiting_upload" | "queued" | "running" | "reconciling" | "succeeded" | "failed" | "outcome_unknown";
 export type OperationPhase = "queued" | "awaiting_upload" | "upload" | "integrity_check" | "image_import" | "suitability_check" | "reference_check" | "token_creation" | "token_revocation" | "native_action" | "reconciliation" | "cleanup" | "completed";
-export type ManagementAction = "image_name" | "restart" | "resize" | "release" | "destroy" | "port_add" | "port_remove" | "image_import" | "default_image_select" | "image_retire" | "image_delete" | "drain_enter" | "reconcile" | "gc" | "token_create" | "token_revoke";
+export type ManagementAction = "image_name" | "restart" | "resize" | "release" | "destroy" | "pin" | "unpin" | "port_add" | "port_remove" | "image_import" | "default_image_select" | "image_retire" | "image_delete" | "drain_enter" | "reconcile" | "gc" | "token_create" | "token_revoke";
 
 export interface SafeError {
   code: string;
