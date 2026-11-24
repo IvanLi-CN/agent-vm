@@ -346,7 +346,7 @@ func TestRecoveryPointEndpoints(t *testing.T) {
 		t.Fatalf("status = %d, decode = %v", response.StatusCode, err)
 	}
 	_ = response.Body.Close()
-	if len(listed.Value.Points) != 3 || listed.Value.Budget != 3 || !listed.Value.Points[0].Eligible || listed.Value.Points[1].Eligible {
+	if listed.Value.Total != 3 || len(listed.Value.Points) != 3 || listed.Value.Budget != 3 || !listed.Value.Points[0].Eligible || listed.Value.Points[1].Eligible {
 		t.Fatalf("listing = %+v", listed.Value)
 	}
 	pruned, err := http.Post(server.URL+"/v1/recovery-points/prune", "application/json", strings.NewReader("{}"))
@@ -412,5 +412,16 @@ func TestTransactionExposesRecordedCause(t *testing.T) {
 	_ = response.Body.Close()
 	if !strings.Contains(envelope.Error.Reason, "refusing") && envelope.Error.Reason == "" {
 		t.Fatalf("error response carries no reason: %+v", envelope.Error)
+	}
+}
+
+func TestSuccessfulTransactionReportsNoFailureMessage(t *testing.T) {
+	value := publicTransaction(store.Transaction{ID: "tx-ok", Phase: PhaseFinalize, State: "finalized", TargetSlot: "green", PreviousSlot: "blue"})
+	if value["error_code"] != "none" || value["error_message"] != "" {
+		t.Fatalf("successful transaction reports a failure: %v / %v", value["error_code"], value["error_message"])
+	}
+	failed := publicTransaction(store.Transaction{ID: "tx-bad", Phase: PhaseStage, State: "failed", ErrorCode: "stage_rejected", ErrorMessage: "boom"})
+	if failed["error_message"] != "deployment stage was rejected" {
+		t.Fatalf("failed transaction lost its message: %v", failed["error_message"])
 	}
 }
