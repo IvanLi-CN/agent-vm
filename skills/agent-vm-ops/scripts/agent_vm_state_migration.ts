@@ -355,7 +355,12 @@ function restoreCheck(args: string[]): void {
   console.log(JSON.stringify({ verdict: authorization.verdict, output: outputPath, trusted_commit: trustedCommit }));
 }
 
-const [command, ...args] = process.argv.slice(2);
-if (command === "preflight") preflight(args);
-else if (command === "restore-check") restoreCheck(args);
-else fail(usage);
+// The deploy/ compatibility wrapper imports this module and then re-runs it as
+// a child process. Dispatching at import time would execute every command twice
+// and reject the second preflight's now non-empty output directory.
+if (import.meta.main) {
+  const [command, ...args] = process.argv.slice(2);
+  if (command === "preflight") preflight(args);
+  else if (command === "restore-check") restoreCheck(args);
+  else fail(usage);
+}

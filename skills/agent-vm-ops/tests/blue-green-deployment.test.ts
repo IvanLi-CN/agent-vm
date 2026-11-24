@@ -172,6 +172,16 @@ test("CA generation and state preflight require operator evidence", () => {
     expect(manifest.fence.sqlite_writers_closed).toBe(true);
     expect(manifest.state_epoch).toBe("epoch-1");
 
+    // The deploy/ compatibility entrypoint imports the Skill implementation and
+    // then re-runs it as a child process, so one preflight must stay one
+    // preflight and keep the reserved directory empty only until it writes.
+    const wrappedDir = join(temporaryRoot, "wrapped-migration");
+    const wrapped = run([process.execPath, resolve(root, "deploy/scripts/agent_vm_state_migration.ts"), "preflight", "--source", source, "--evidence", evidence, "--evidence-public-key", signer.publicKey, "--output-dir", wrappedDir]);
+    expect(new TextDecoder().decode(wrapped.stderr)).not.toContain("output-dir must be empty");
+    expect(wrapped.exitCode).toBe(0);
+    expect(existsSync(join(wrappedDir, "snapshot-manifest.json"))).toBe(true);
+    expect(existsSync(join(wrappedDir, ".agent-vm-state-migration.lock"))).toBe(false);
+
     const blockedSource = join(temporaryRoot, "blocked.sqlite3");
     const blockedDatabase = run(["python3", "-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(\"CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO meta VALUES ('state_epoch','epoch-1'); CREATE TABLE tasks (session_id TEXT NOT NULL, generation INTEGER NOT NULL); INSERT INTO tasks VALUES ('session-1',7); CREATE TABLE operations (operation_id TEXT, response_json TEXT); INSERT INTO operations VALUES ('lifecycle-pending', '{\\\"outcome\\\":\\\"pending\\\"}'); CREATE TABLE management_operations (operation_id TEXT, status TEXT); INSERT INTO management_operations VALUES ('blocked-upload','awaiting_upload');\"); c.commit(); c.close()", blockedSource]);
     expect(blockedDatabase.exitCode).toBe(0);
