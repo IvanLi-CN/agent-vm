@@ -196,7 +196,11 @@ Demo 场景检查面板必须遵循[Web Demo 检查面板交互合同](contracts
 
 ### REQ-AGENT-VM-031 - 槽位外部署控制器
 
+普通蓝绿 stage-only `needs_recovery` 事务可由 `recover --action retry-stage` 在原 transaction ID 上前向恢复；只接受持久化的 `stage_effect_started`、原 backup-gated recovery point、原 bundle 和与原 previous release 绑定的 fresh consistent observation。active slot 必须仍被 selected、进程可观测但无 controller/traffic、无独立 drain owner，且所有 active in-flight/native/pending 计数已知为零；target 必须停止，或是同 bundle 的 process-ready fenced candidate。恢复复用同一 recovery point 和 transaction，不 restore snapshot、不创建新 transaction、不修改业务状态；候选按当前所有 state capabilities 验证后停在 controller_handoff，由运维者显式 activate 同一 ID。任何 identity、coverage、freshness、quiescence 或结果证据不确定都保持 needs_recovery 并 fence 两槽。
+
 部署控制器必须作为稳定的 Go 服务运行在蓝绿槽位外，在任一槽位处于暂存、活动、退役或回滚阶段时保持可用。它必须向运维 CLI 提供受保护的本机 Unix socket，并向 Prometheus 提供仅内部管理网络可访问的只读 `GET /metrics` 接口。该接口不得成为公共 TCP/HTTP 路由或业务 API；Deployd 不得获取 Incus/PVE 管理权限或拥有业务状态。普通蓝绿事务不得写入 rqlite 或访问业务状态数据库；首次部署的固定 `migrate` 事务是一次性例外，必须受固定源路径、目标 URL、systemd 单元和阶段状态机约束。独立 SQLite 数据库必须保存部署事务标识、阶段事件、失败证据和最新观测快照，不得保存会话、租约、代次、操作日志或业务资源状态。它必须分别观测选定槽位、进程健康、就绪、控制器主权、流量角色、在途请求及原生工作进程静止状态，并提供来源及新鲜度。`/metrics` 必须返回最近一次完成的观测快照，不得在采集请求中触发部署变更、槽位采样或原生影响。Prometheus 采集任务名必须为 `agent-vm-deployd`，槽位级指标必须携带 `slot="blue"|"green"`，不得因双槽位同时存活而产生重复序列。切换期间两个槽位可以同时存活，但必须恰好一个持有调度器、状态核对、按时间垃圾回收及调度器驱动原生变更所需的控制器主权。槽位取得已认证角色前不得运行启动核对或这些后台变更循环；失去角色时必须立即围栏。观测缺失或矛盾时，必须拒绝继续并使事务保持可恢复，不得认定成功。
+普通蓝绿事务的 `stage` 在效果开始后失败并进入 `needs_recovery` 时，只有原事务、原已验证 recovery point、原 bundle 及其阶段身份均可验证，active selected/state authority 保持一致、active traffic 已关闭、两槽均无 controller role，且所有在途请求/native worker/pending operation 计数已知为零时，Deployd 才可通过 `recover --action retry-stage` 对原 target slot 重新 stage 并 verify。该恢复不得创建新 transaction、申请或替换 recovery point、恢复 snapshot 或修改业务数据库；候选验证完成后必须保留原 transaction ID 并停在 `controller_handoff`，后续只允许普通 activate 继续交接。证据缺失、状态能力不兼容、另一个 release drain owner 仍存在或效果不确定时必须继续 fencing 并拒绝恢复。
+在 stage 重试的效果结果丢失时，Deployd 必须沿用原事务并先检查 target slot：target 已停止时才可重新 stage；target 已运行时只能在相同 bundle 的 manifest/source identity、state authority、capabilities 和 process identity 均重新验证后继续，身份不同或无法读取时保持 fencing 并拒绝覆盖。
 
 ### REQ-AGENT-VM-034 - 客户端运行与发布校验解耦
 

@@ -33,6 +33,9 @@ type recoveryPointCreator interface {
 	CreateRecoveryPoint(context.Context, string, string, string, map[string]bool, time.Time) error
 	RecoveryAuthority() string
 }
+type recoveryPointValidator interface {
+	ValidateRecoveryPoint(context.Context, string, string, string) (recoveryPoint, error)
+}
 
 func (manager *Manager) usesRecoveryPoints() bool {
 	runtime, ok := manager.Runtime.(recoveryPointCreator)
@@ -188,6 +191,76 @@ func (runtime *HostRuntime) CreateRecoveryPoint(ctx context.Context, operation, 
 		return err
 	}
 	return syncMigrationDirectory(root)
+}
+
+// ValidateRecoveryPoint verifies an existing transaction-bound recovery point without creating,
+// deleting, or restoring business state. Recovery actions use it before retrying a staged bundle.
+func (runtime *HostRuntime) ValidateRecoveryPoint(ctx context.Context, operation, purpose, authority string) (recoveryPoint, error) {
+	var empty recoveryPoint
+	if operation == "" || purpose == "" || authority == "" || authority != runtime.RecoveryAuthority() {
+		return empty, errors.New("recovery point identity does not match the configured state authority")
+	}
+	root := runtime.recoveryDirectory()
+	info, err := os.Lstat(root)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		return empty, errors.New("rqlite recovery directory is unavailable or not private")
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return empty, err
+	}
+	var match *recoveryPoint
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".pending-") || strings.HasPrefix(name, ".record-") {
+			return empty, errors.New("incomplete recovery material prevents stage retry")
+		}
+		if strings.HasPrefix(name, "pruned-") && strings.HasSuffix(name, ".json") {
+			pruned, err := os.Lstat(filepath.Join(root, name))
+			if err != nil || pruned.Mode()&os.ModeSymlink != 0 || !pruned.Mode().IsRegular() {
+				return empty, errors.New("recovery deletion receipt is invalid")
+			}
+			continue
+		}
+		path := filepath.Join(root, name)
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != 0o700 || !strings.HasPrefix(name, "point-") {
+			return empty, errors.New("rqlite recovery directory contains an unrecognized entry")
+		}
+		data, err := os.ReadFile(filepath.Join(path, "point.json"))
+		var point recoveryPoint
+		if err != nil || json.Unmarshal(data, &point) != nil || point.ID != name || !validMigrationDigest(point.Authority) ||
+			point.Operation == "" || point.Purpose == "" || point.Created.IsZero() || !validMigrationDigest(point.SHA256) ||
+			!strings.HasSuffix(point.Boundary, ":"+point.ID) || point.Size <= 0 {
+			return empty, errors.New("registered rqlite recovery point is invalid")
+		}
+		snapshot, err := os.Lstat(filepath.Join(path, "snapshot.sqlite3"))
+		if err != nil || snapshot.Mode()&os.ModeSymlink != 0 || !snapshot.Mode().IsRegular() || snapshot.Size() != point.Size {
+			return empty, errors.New("registered rqlite recovery material is missing or incomplete")
+		}
+		if _, err := os.Lstat(filepath.Join(root, "pruned-"+name+".json")); err == nil {
+			if point.Operation == operation && point.Purpose == purpose && point.Authority == authority {
+				return empty, errors.New("original transaction recovery point is marked for deletion")
+			}
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return empty, err
+		}
+		if point.Operation != operation || point.Purpose != purpose || point.Authority != authority {
+			continue
+		}
+		if match != nil {
+			return empty, errors.New("recovery point identity is ambiguous")
+		}
+		match = &point
+	}
+	if match == nil {
+		return empty, errors.New("original transaction recovery point is missing")
+	}
+	if err := validateRegisteredRecoveryPoint(ctx, root, *match); err != nil {
+		return empty, err
+	}
+	return *match, nil
 }
 
 func (runtime *HostRuntime) writeRecoveryMarker(ctx context.Context, client *http.Client, endpoint, id string) error {

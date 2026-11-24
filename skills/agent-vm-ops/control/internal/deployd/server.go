@@ -221,6 +221,11 @@ type request struct {
 	Action        string `json:"action"`
 }
 
+type recoverRequest struct {
+	TransactionID string `json:"transaction_id"`
+	Action        string `json:"action"`
+}
+
 func (server *Server) plan(c *gin.Context) {
 	var value request
 	if !decodeRequest(c, &value) {
@@ -311,8 +316,12 @@ func (server *Server) rollback(c *gin.Context) {
 }
 
 func (server *Server) recover(c *gin.Context) {
-	var value request
+	var value recoverRequest
 	if !decodeRequest(c, &value) {
+		return
+	}
+	if value.TransactionID == "" || value.Action == "" {
+		writeError(c, http.StatusBadRequest, "invalid_request", "recovery transaction_id and action are required")
 		return
 	}
 	transaction, err := server.Manager.Recover(c.Request.Context(), value.TransactionID, value.Action)

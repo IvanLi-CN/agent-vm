@@ -108,6 +108,8 @@ func run(args []string) error {
 		switch {
 		case command == "migrate":
 			*timeoutSeconds = 9000
+		case command == "recover" && *action == "retry-stage":
+			*timeoutSeconds = 900
 		case command == "rollback" || (command == "recover" && *action == "rollback"):
 			*timeoutSeconds = 480
 		default:

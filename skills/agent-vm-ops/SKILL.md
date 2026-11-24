@@ -20,7 +20,7 @@ Mutation 前检查精确的 candidate revision/checksum、component version、na
 
 服务账户迁移时，SSH 请求使用 root 专用 `/run/agent-vm-native/control.sock`，不能继续直连活跃槽 `app.sock`。新入口由安装器在候选启动前启用；它按实际槽位 UID 转发，包括历史版本回退。连接资料切换后须检查普通 `status` 和业务操作，不能用 `doctor` 或部署状态替代。按需转发进程不改变两个常驻服务的专用账户。
 
-计划维护时进入 `agent-vm admin drain enter`，检查 drain status，等待 effective lease 结束，并确认 cleanup 已关闭 NAT/flow 且停止 container。
+计划维护时进入 `agent-vm admin drain enter`，检查 drain status，等待 effective lease 结束，并确认 cleanup 已关闭 NAT/flow 且停止 container。该流程适用于独立宿主维护；普通 `agent-vm-deploy update` 是自有 release transaction，会管理其 stage、controller handoff 和 drain，更新前不得另行进入维护 drain。已有独立 drain owner 必须由原 session 在保持 traffic 关闭的条件下退出；不得让 release transaction 覆盖另一个 `release-*` owner。
 Drain 拒绝新的 lease 和 restart admission，允许在线 retrieval/release，不会静默延长 deadline。
 pinned VM 不会自行到期，可能让 drain 等待无法收敛。先按 session/task 列出保留目标和理由，交由 owner 决定 unpin、release 或 destroy；不要代替其他会话强行 unpin，也不要把保留中的 VM 当作可回收 cache。
 已经越过短 admission fence 的 restart 可以在不持有 global lock 的情况下完成。
