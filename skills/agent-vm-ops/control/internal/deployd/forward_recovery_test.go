@@ -184,3 +184,44 @@ func TestRecoverEndpointRequiresBundleOnlyForCompleteForward(t *testing.T) {
 		t.Fatalf("invalid recovery requests changed the transaction = %#v, %v", unchanged, err)
 	}
 }
+
+func forwardSnapshot(now time.Time) RuntimeSnapshot {
+	sources := map[string]SourceObservation{
+		"active_link":    {Up: true, ObservedAt: now, FreshUntil: now.Add(30 * time.Second)},
+		"systemd":        {Up: true, ObservedAt: now, FreshUntil: now.Add(30 * time.Second)},
+		"slot_contracts": {Up: false, ObservedAt: now, FreshUntil: now.Add(30 * time.Second), Error: "one or more slot health contracts could not be observed"},
+	}
+	return RuntimeSnapshot{
+		ObservedAt: now, FreshUntil: now.Add(30 * time.Second),
+		ActiveSlot: "green", ControllerSlot: "none", Consistent: false,
+		Slots:   map[string]SlotObservation{"blue": {Slot: "blue", ObservedUnix: now.Unix()}, "green": {Slot: "green", ObservedUnix: now.Unix()}},
+		Sources: sources,
+	}
+}
+
+func TestForwardRecoveryObservationAcceptsStoppedActiveSlot(t *testing.T) {
+	now := time.Now().UTC()
+	snapshot := forwardSnapshot(now)
+	transaction := store.Transaction{TargetSlot: "blue", PreviousSlot: "green"}
+	if err := forwardRecoveryObservation(snapshot, transaction, now); err != nil {
+		t.Fatalf("stopped active slot was rejected: %v", err)
+	}
+	running := forwardSnapshot(now)
+	previous := running.Slots["green"]
+	previous.ProcessUp = true
+	previous.ProcessReady = true
+	running.Slots["green"] = previous
+	if err := forwardRecoveryObservation(running, transaction, now); err == nil {
+		t.Fatal("running previous slot was accepted")
+	}
+	controlled := forwardSnapshot(now)
+	controlled.ControllerSlot = "blue"
+	if err := forwardRecoveryObservation(controlled, transaction, now); err == nil {
+		t.Fatal("controller role was accepted")
+	}
+	stale := forwardSnapshot(now)
+	stale.FreshUntil = now.Add(-time.Second)
+	if err := forwardRecoveryObservation(stale, transaction, now); err == nil {
+		t.Fatal("stale observation was accepted")
+	}
+}

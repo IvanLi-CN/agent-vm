@@ -1025,7 +1025,7 @@ func (manager *Manager) CompleteForward(ctx context.Context, id, bundle string) 
 	if err != nil {
 		return nil, err
 	}
-	if err := forwardRecoveryObservation(observation, *transaction, manager.Clock().UTC(), previousRelease, previousSource, previousAuthority); err != nil {
+	if err := forwardRecoveryObservation(observation, *transaction, manager.Clock().UTC()); err != nil {
 		return nil, err
 	}
 	if _, err := manager.transition(ctx, id, transaction.Phase, PhaseControllerHandoff, "forward_recovery_started", map[string]any{
@@ -1111,9 +1111,20 @@ func (manager *Manager) CompleteForward(ctx context.Context, id, bundle string) 
 	return manager.Store.Get(ctx, id)
 }
 
-func forwardRecoveryObservation(observation RuntimeSnapshot, transaction store.Transaction, now time.Time, previousRelease, previousSource, previousAuthority string) error {
-	if !validObservation(observation, now) {
-		return errors.New("complete-forward requires a fresh consistent observation")
+// forwardRecoveryObservation accepts the fenced state this recovery exists for:
+// the active slot is already stopped, so slot health contracts and business
+// readiness cannot be observed. Structural authority (active link and systemd
+// slot identities) must still be fresh, and no slot may hold a role.
+func forwardRecoveryObservation(observation RuntimeSnapshot, transaction store.Transaction, now time.Time) error {
+	if observation.ObservedAt.IsZero() || observation.FreshUntil.IsZero() || !observation.FreshUntil.After(now) {
+		return errors.New("complete-forward requires a fresh observation")
+	}
+	for _, name := range []string{"active_link", "systemd"} {
+		source, ok := observation.Sources[name]
+		if !ok || !source.Up || source.ObservedAt.IsZero() || source.FreshUntil.IsZero() || !source.FreshUntil.After(now) ||
+			source.ObservedAt.After(now) || source.ObservedAt.Before(observation.ObservedAt.Add(-2*time.Second)) {
+			return fmt.Errorf("complete-forward requires a fresh %s observation", name)
+		}
 	}
 	if observation.ActiveSlot != transaction.PreviousSlot || observation.ControllerSlot != "none" {
 		return errors.New("complete-forward requires the original active slot with no controller")
@@ -1127,12 +1138,6 @@ func forwardRecoveryObservation(observation RuntimeSnapshot, transaction store.T
 	previous, previousOK := observation.Slots[transaction.PreviousSlot]
 	if !previousOK || previous.ProcessUp || previous.ProcessReady || previous.InFlightRequests != 0 || previous.NativeWorkers != 0 || previous.PendingOperations != 0 {
 		return errors.New("complete-forward requires the previous slot stopped and idle")
-	}
-	if previous.ReleaseID != "" && previous.ReleaseID != previousRelease || previous.SourceRevision != "" && previous.SourceRevision != previousSource {
-		return errors.New("complete-forward observed an unexpected previous release identity")
-	}
-	if previous.StateAuthority != "" && previous.StateAuthority != previousAuthority {
-		return errors.New("complete-forward observed an unexpected previous state authority")
 	}
 	target, targetOK := observation.Slots[transaction.TargetSlot]
 	if !targetOK {
