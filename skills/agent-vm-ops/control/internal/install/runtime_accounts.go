@@ -54,11 +54,17 @@ func DeployBinaryVersion(path string) (string, error) {
 // release copy, keeping one reversible backup under the same version-free name.
 // The caller owns restarting agent-vm-deployd.service.
 func InstallMaintenanceBinary(product string) ([]string, error) {
+	return installDeployBinary(product, copyInstall)
+}
+
+// installDeployBinary takes the copy function so the path set and backup
+// semantics can be tested without privileged parent directories.
+func installDeployBinary(product string, copy func(string, string, os.FileMode, string) error) ([]string, error) {
 	source := filepath.Join(product, "bin", "agent-vm-deploy")
 	var backups []string
 	for _, target := range DeployBinaryPaths {
 		staged := target + ".new"
-		if err := copyInstall(source, staged, 0755, ""); err != nil {
+		if err := copy(source, staged, 0755, ""); err != nil {
 			return backups, err
 		}
 		backup := target + ".previous"

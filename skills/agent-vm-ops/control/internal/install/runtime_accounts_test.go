@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 )
 
@@ -86,9 +85,6 @@ func TestDeployBinaryVersionReadsSelfReport(t *testing.T) {
 }
 
 func TestInstallMaintenanceBinaryRefreshesEveryOperatorPath(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("installation paths are protected by Linux parent ownership checks")
-	}
 	product := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(product, "bin"), 0o755); err != nil {
 		t.Fatal(err)
@@ -109,7 +105,13 @@ func TestInstallMaintenanceBinaryRefreshesEveryOperatorPath(t *testing.T) {
 	previous := DeployBinaryPaths
 	DeployBinaryPaths = targets
 	defer func() { DeployBinaryPaths = previous }()
-	backups, err := InstallMaintenanceBinary(product)
+	binary, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backups, err := installDeployBinary(product, func(_, destination string, _ os.FileMode, _ string) error {
+		return os.WriteFile(destination, binary, 0o755)
+	})
 	if err != nil || len(backups) != len(targets) {
 		t.Fatalf("backups = %v, err = %v", backups, err)
 	}
