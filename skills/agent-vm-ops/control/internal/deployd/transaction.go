@@ -493,6 +493,7 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	if err := manager.transitionAfterEffect(ctx, id, PhaseQuiescence, PhaseFinalize, "finalized", map[string]any{"quiescent": true}); err != nil {
 		return nil, err
 	}
+	manager.startupFenced = false
 	updated, err := manager.Store.Get(ctx, id)
 	return updated, err
 }
@@ -588,6 +589,9 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 	transaction, err := manager.Store.Get(ctx, id)
 	if err != nil || transaction == nil {
 		return transaction, errOrNotFound(err, id, transaction)
+	}
+	if action == "retry-stage" {
+		return manager.retryStage(ctx, *transaction)
 	}
 	if !transaction.RecoveryRequired && transaction.State != "needs_recovery" {
 		return nil, errors.New("transaction does not require recovery")
@@ -736,8 +740,424 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 		manager.startupFenced = false
 		return updated, nil
 	default:
-		return nil, errors.New("recovery action must be rollback or finalize")
+		return nil, errors.New("recovery action must be retry-stage, rollback or finalize")
 	}
+}
+
+func (manager *Manager) retryStage(ctx context.Context, transaction store.Transaction) (*store.Transaction, error) {
+	if validSlot(transaction.TargetSlot) != nil || validSlot(transaction.PreviousSlot) != nil || transaction.TargetSlot == transaction.PreviousSlot {
+		return nil, errors.New("stage recovery requires distinct fixed slots")
+	}
+	if transaction.Phase != PhaseStage && transaction.Phase != PhaseStandbyValidation && transaction.Phase != PhaseControllerHandoff {
+		return nil, errors.New("stage recovery is limited to stage, standby_validation, or controller_handoff")
+	}
+	created, err := manager.Store.LatestEventByTransition(ctx, transaction.ID, "created")
+	if err != nil || created == nil {
+		return nil, errors.New("original stage identity is unavailable")
+	}
+	if created.Evidence["backup_before_stage"] != true || created.Evidence["active_slot"] != transaction.PreviousSlot {
+		return nil, errors.New("stage recovery requires the original backup-gated transaction")
+	}
+	started, err := manager.Store.LatestEventByTransition(ctx, transaction.ID, "stage_effect_started")
+	if err != nil || started == nil {
+		return nil, errors.New("stage recovery requires a persisted stage effect intent")
+	}
+	prepared, err := manager.Store.LatestEvent(ctx, transaction.ID, PhaseStage, "retry_stage_prepared")
+	if err != nil {
+		return nil, err
+	}
+	if !transaction.RecoveryRequired && transaction.State != "needs_recovery" &&
+		(transaction.State != "active" || prepared == nil || (transaction.Phase != PhaseStandbyValidation && transaction.Phase != PhaseControllerHandoff)) {
+		return nil, errors.New("stage recovery does not match an active retained retry intent")
+	}
+	previousRelease, previousSource, previousAuthority, originalCapabilities, err := previousIdentityFromEvent(created)
+	if err != nil {
+		return nil, err
+	}
+	validator, ok := manager.Runtime.(recoveryPointValidator)
+	if !ok || !manager.usesRecoveryPoints() {
+		return nil, errors.New("stage recovery requires an existing verified rqlite recovery point")
+	}
+	point, err := validator.ValidateRecoveryPoint(ctx, transaction.ID, "stage", previousAuthority)
+	if err != nil {
+		return nil, fmt.Errorf("validate original stage recovery point: %w", err)
+	}
+	preflight, ok := manager.Runtime.(RuntimePreflight)
+	if !ok {
+		return nil, errors.New("stage recovery requires formal bundle preflight")
+	}
+	if err := preflight.Preflight(ctx, transaction.TargetSlot, transaction.Bundle); err != nil {
+		return nil, err
+	}
+	observation, err := manager.observe(ctx, transaction.ID)
+	if err != nil {
+		return nil, err
+	}
+	if !validObservation(observation, manager.Clock().UTC()) || observation.ActiveSlot != transaction.PreviousSlot || observation.ControllerSlot != "none" {
+		return nil, errors.New("stage recovery requires a fresh consistent observation of the original active slot with no controller")
+	}
+	for _, slot := range []string{"blue", "green"} {
+		current := observation.Slots[slot]
+		if current.ControllerOwned || current.TrafficAccepting {
+			return nil, errors.New("stage recovery requires both slots fenced from controller and traffic")
+		}
+	}
+	previous, previousOK := observation.Slots[transaction.PreviousSlot]
+	target, targetOK := observation.Slots[transaction.TargetSlot]
+	if !previousOK || !previous.ProcessUp || !previous.ProcessReady || previous.TrafficAccepting ||
+		!previous.CountersKnown || previous.InFlightRequests != 0 || previous.NativeWorkers != 0 || previous.PendingOperations != 0 ||
+		previous.ReleaseID != previousRelease || previous.SourceRevision != previousSource || previous.StateAuthority != previousAuthority ||
+		previous.StateEpoch == "" || !capabilitySuperset(previous.StateCapabilities, originalCapabilities) || !targetOK ||
+		target.ControllerOwned || target.TrafficAccepting || target.InFlightRequests != 0 || target.NativeWorkers != 0 || target.PendingOperations != 0 ||
+		(target.ProcessUp && (!target.ProcessReady || !target.CountersKnown || target.InFlightRequests != 0 || target.NativeWorkers != 0 || target.PendingOperations != 0)) {
+		return nil, errors.New("stage recovery incumbent or target slot is not safely fenced and quiescent")
+	}
+	if prepared == nil {
+		if transaction.Phase != PhaseStage || transaction.State != "needs_recovery" {
+			return nil, errors.New("stage recovery retry identity is missing")
+		}
+	}
+	if prepared == nil {
+		if !capabilitySuperset(previous.StateCapabilities, originalCapabilities) {
+			return nil, errors.New("current state capabilities no longer include the original deployment contract")
+		}
+		evidence := map[string]any{
+			"previous_release_id": previous.ReleaseID, "previous_source_revision": previous.SourceRevision,
+			"previous_state_epoch": previous.StateEpoch, "previous_state_authority": previous.StateAuthority,
+			"previous_state_capabilities": append([]string(nil), previous.StateCapabilities...),
+			"recovery_point_id":           point.ID, "recovery_point_sha256": point.SHA256, "recovery_point_boundary": point.Boundary,
+		}
+		if _, err := manager.Store.Transition(ctx, transaction.ID, PhaseStage, PhaseStage, "needs_recovery", "retry_stage_prepared", "deployd", evidence, manager.Clock().UTC()); err != nil {
+			return nil, err
+		}
+	} else if !stageRetryCheckpointMatches(prepared.Evidence, previous, point) {
+		return nil, errors.New("stage recovery checkpoint no longer matches the active slot or original recovery point")
+	}
+	if transaction.Phase == PhaseStage {
+		if err := manager.Runtime.Drain(ctx, transaction.PreviousSlot); err != nil {
+			return nil, fmt.Errorf("establish original release drain for stage recovery: %w", err)
+		}
+		observation, err = manager.observe(ctx, transaction.ID)
+		if err != nil {
+			return nil, manager.effectFailure(ctx, transaction.ID, transaction.Phase, err)
+		}
+		currentPrevious, previousOK := observation.Slots[transaction.PreviousSlot]
+		currentTarget, targetOK := observation.Slots[transaction.TargetSlot]
+		if !validObservation(observation, manager.Clock().UTC()) || observation.ActiveSlot != transaction.PreviousSlot || observation.ControllerSlot != "none" ||
+			!previousOK || !currentPrevious.ProcessUp || !currentPrevious.ProcessReady || !currentPrevious.Draining || currentPrevious.TrafficAccepting || !currentPrevious.CountersKnown ||
+			currentPrevious.InFlightRequests != 0 || currentPrevious.NativeWorkers != 0 || currentPrevious.PendingOperations != 0 || currentPrevious.ReleaseID != previous.ReleaseID ||
+			currentPrevious.SourceRevision != previous.SourceRevision || currentPrevious.StateAuthority != previous.StateAuthority || currentPrevious.StateEpoch == "" ||
+			!sameStateCapabilities(currentPrevious.StateCapabilities, previous.StateCapabilities) || !targetOK || currentTarget.ControllerOwned || currentTarget.TrafficAccepting ||
+			(currentTarget.ProcessUp && (!currentTarget.ProcessReady || !currentTarget.CountersKnown || currentTarget.InFlightRequests != 0 || currentTarget.NativeWorkers != 0 || currentTarget.PendingOperations != 0)) {
+			return nil, manager.effectFailure(ctx, transaction.ID, transaction.Phase, errors.New("stage recovery drain or slot quiescence was not verified"))
+		}
+		drainEvidence := map[string]any{
+			"previous_release_id": currentPrevious.ReleaseID, "previous_source_revision": currentPrevious.SourceRevision,
+			"drained_state_epoch": currentPrevious.StateEpoch, "previous_state_authority": currentPrevious.StateAuthority,
+			"previous_state_capabilities": append([]string(nil), currentPrevious.StateCapabilities...),
+			"recovery_point_id":           point.ID, "recovery_point_sha256": point.SHA256, "recovery_point_boundary": point.Boundary,
+		}
+		if _, err := manager.Store.Transition(ctx, transaction.ID, PhaseStage, PhaseStage, transaction.State, "retry_stage_drained", "deployd", drainEvidence, manager.Clock().UTC()); err != nil {
+			return nil, err
+		}
+		previous = currentPrevious
+		target = currentTarget
+		if !target.ProcessUp {
+			if err := manager.Runtime.Stage(ctx, transaction.TargetSlot, transaction.Bundle); err != nil {
+				return nil, manager.effectFailure(ctx, transaction.ID, PhaseStage, fmt.Errorf("retry stage failed: %w", err))
+			}
+		}
+	} else {
+		if !target.ProcessUp || !target.ProcessReady || !target.CountersKnown || target.InFlightRequests != 0 || target.NativeWorkers != 0 || target.PendingOperations != 0 {
+			return nil, errors.New("recovery candidate is not process-ready and quiescent after its stage phase")
+		}
+	}
+	if transaction.Phase == PhaseStage {
+		if err := manager.transitionAfterEffect(ctx, transaction.ID, PhaseStage, PhaseStandbyValidation, "stage_retried", map[string]any{"target_slot": transaction.TargetSlot, "reused_recovery_point": point.ID}); err != nil {
+			return nil, err
+		}
+		transaction.Phase = PhaseStandbyValidation
+	}
+	if transaction.Phase == PhaseStandbyValidation {
+		return manager.verifyRetryStageCandidate(ctx, transaction, previous, point)
+	}
+	return manager.reverifyRetryStageCandidate(ctx, transaction, previous, point)
+}
+
+func (manager *Manager) verifyRetryStageCandidate(ctx context.Context, transaction store.Transaction, previous SlotObservation, point recoveryPoint) (*store.Transaction, error) {
+	if err := manager.verifyRetryStageBundle(ctx, transaction.TargetSlot, transaction.Bundle); err != nil {
+		return nil, manager.effectFailure(ctx, transaction.ID, PhaseStandbyValidation, fmt.Errorf("retry candidate verification failed: %w", err))
+	}
+	observation, err := manager.observe(ctx, transaction.ID)
+	if err != nil {
+		return nil, manager.effectFailure(ctx, transaction.ID, PhaseStandbyValidation, err)
+	}
+	target, targetOK := observation.Slots[transaction.TargetSlot]
+	currentPrevious, previousOK := observation.Slots[transaction.PreviousSlot]
+	if !validObservation(observation, manager.Clock().UTC()) || observation.ActiveSlot != transaction.PreviousSlot || observation.ControllerSlot != "none" ||
+		!targetOK || !target.ProcessUp || !target.ProcessReady || target.ControllerOwned || target.TrafficAccepting || target.ReleaseID == "" ||
+		target.SourceRevision == "" || target.StateEpoch == "" || target.StateAuthority != previous.StateAuthority || !sameStateCapabilities(target.StateCapabilities, previous.StateCapabilities) ||
+		!previousOK || !currentPrevious.ProcessUp || !currentPrevious.ProcessReady || currentPrevious.ControllerOwned || currentPrevious.TrafficAccepting || !currentPrevious.CountersKnown ||
+		currentPrevious.InFlightRequests != 0 || currentPrevious.NativeWorkers != 0 || currentPrevious.PendingOperations != 0 || currentPrevious.ReleaseID != previous.ReleaseID ||
+		currentPrevious.SourceRevision != previous.SourceRevision || currentPrevious.StateEpoch == "" || currentPrevious.StateAuthority != previous.StateAuthority ||
+		!sameStateCapabilities(currentPrevious.StateCapabilities, previous.StateCapabilities) {
+		return nil, manager.effectFailure(ctx, transaction.ID, PhaseStandbyValidation, errors.New("retry candidate or incumbent identity changed during stage recovery"))
+	}
+	if err := manager.transitionAfterEffect(ctx, transaction.ID, PhaseStandbyValidation, PhaseControllerHandoff, "verified", map[string]any{
+		"candidate_ready": true, "release_id": target.ReleaseID, "source_revision": target.SourceRevision,
+		"state_epoch": target.StateEpoch, "state_authority": target.StateAuthority,
+		"state_capabilities": append([]string(nil), target.StateCapabilities...), "recovery_point_id": point.ID,
+	}); err != nil {
+		return nil, err
+	}
+	return manager.Store.Get(ctx, transaction.ID)
+}
+
+func (manager *Manager) reverifyRetryStageCandidate(ctx context.Context, transaction store.Transaction, previous SlotObservation, point recoveryPoint) (*store.Transaction, error) {
+	releaseID, sourceRevision, authority, capabilities, err := manager.verifiedCandidateIdentity(ctx, transaction.ID)
+	if err != nil {
+		return nil, err
+	}
+	if err := manager.verifyRetryStageBundle(ctx, transaction.TargetSlot, transaction.Bundle); err != nil {
+		return nil, manager.effectFailure(ctx, transaction.ID, transaction.Phase, fmt.Errorf("retry candidate verification failed: %w", err))
+	}
+	observation, err := manager.observe(ctx, transaction.ID)
+	if err != nil {
+		return nil, manager.effectFailure(ctx, transaction.ID, transaction.Phase, err)
+	}
+	target, targetOK := observation.Slots[transaction.TargetSlot]
+	currentPrevious, previousOK := observation.Slots[transaction.PreviousSlot]
+	if !validObservation(observation, manager.Clock().UTC()) || observation.ActiveSlot != transaction.PreviousSlot || observation.ControllerSlot != "none" ||
+		!targetOK || !target.ProcessUp || !target.ProcessReady || target.ControllerOwned || target.TrafficAccepting || target.ReleaseID != releaseID ||
+		target.SourceRevision != sourceRevision || target.StateAuthority != authority || !sameStateCapabilities(target.StateCapabilities, capabilities) ||
+		!previousOK || !currentPrevious.ProcessUp || !currentPrevious.ProcessReady || currentPrevious.ControllerOwned || currentPrevious.TrafficAccepting || !currentPrevious.CountersKnown ||
+		currentPrevious.InFlightRequests != 0 || currentPrevious.NativeWorkers != 0 || currentPrevious.PendingOperations != 0 || currentPrevious.ReleaseID != previous.ReleaseID ||
+		currentPrevious.SourceRevision != previous.SourceRevision || currentPrevious.StateEpoch == "" || currentPrevious.StateAuthority != previous.StateAuthority ||
+		!sameStateCapabilities(currentPrevious.StateCapabilities, previous.StateCapabilities) {
+		return nil, manager.effectFailure(ctx, transaction.ID, transaction.Phase, errors.New("recovered stage identity is no longer verified"))
+	}
+	current, err := manager.Store.Get(ctx, transaction.ID)
+	if err != nil || current == nil {
+		return nil, errOrNotFound(err, transaction.ID, current)
+	}
+	if current.State == "needs_recovery" || current.RecoveryRequired {
+		if err := manager.transitionAfterEffect(ctx, transaction.ID, transaction.Phase, transaction.Phase, "stage_retry_reverified", map[string]any{
+			"release_id": releaseID, "source_revision": sourceRevision, "state_authority": authority,
+			"state_capabilities": capabilities, "recovery_point_id": point.ID,
+		}); err != nil {
+			return nil, err
+		}
+		return manager.Store.Get(ctx, transaction.ID)
+	}
+	return current, nil
+}
+
+func (manager *Manager) verifyRetryStageBundle(ctx context.Context, slot, bundle string) error {
+	if verifier, ok := manager.Runtime.(interface {
+		PrepareRecoveryController(context.Context, string, string) error
+	}); ok {
+		return verifier.PrepareRecoveryController(ctx, slot, bundle)
+	}
+	return manager.Runtime.Verify(ctx, slot, bundle)
+}
+
+func stageRetryCheckpointMatches(evidence map[string]any, previous SlotObservation, point recoveryPoint) bool {
+	releaseID, releaseOK := evidence["previous_release_id"].(string)
+	sourceRevision, sourceOK := evidence["previous_source_revision"].(string)
+	stateEpoch, epochOK := evidence["previous_state_epoch"].(string)
+	authority, authorityOK := evidence["previous_state_authority"].(string)
+	capabilities, capabilitiesOK := evidenceStrings(evidence["previous_state_capabilities"])
+	pointID, pointIDOK := evidence["recovery_point_id"].(string)
+	pointDigest, pointDigestOK := evidence["recovery_point_sha256"].(string)
+	pointBoundary, pointBoundaryOK := evidence["recovery_point_boundary"].(string)
+	return releaseOK && sourceOK && epochOK && stateEpoch != "" && authorityOK && capabilitiesOK && pointIDOK && pointDigestOK && pointBoundaryOK &&
+		releaseID == previous.ReleaseID && sourceRevision == previous.SourceRevision && authority == previous.StateAuthority &&
+		sameStateCapabilities(capabilities, previous.StateCapabilities) && pointID == point.ID && pointDigest == point.SHA256 && pointBoundary == point.Boundary
+}
+
+// CompleteForward finishes a fenced deployment transaction with a verified
+// candidate when the previous release can no longer start against the current
+// state authority. It installs caller-supplied, preflight-verified bytes only
+// into the original target slot, proves the incumbent is stopped and idle,
+// grants the sole controller role, enables traffic and switches the active
+// link. It never restores, replaces or deletes business state, and it refuses
+// while any slot still holds a role.
+func (manager *Manager) CompleteForward(ctx context.Context, id, bundle string) (*store.Transaction, error) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	transaction, err := manager.Store.Get(ctx, id)
+	if err != nil || transaction == nil {
+		return transaction, errOrNotFound(err, id, transaction)
+	}
+	if transaction.State != "needs_recovery" || !transaction.RecoveryRequired {
+		return nil, errors.New("complete-forward requires a transaction in needs_recovery")
+	}
+	switch transaction.Phase {
+	case PhaseStage, PhaseStandbyValidation, PhaseControllerHandoff, PhaseRollback:
+	default:
+		return nil, fmt.Errorf("complete-forward is not allowed in phase %s", transaction.Phase)
+	}
+	if validSlot(transaction.TargetSlot) != nil || validSlot(transaction.PreviousSlot) != nil || transaction.TargetSlot == transaction.PreviousSlot {
+		return nil, errors.New("complete-forward requires distinct fixed slots")
+	}
+	if bundle == "" || !strings.HasPrefix(bundle, "/") {
+		return nil, errors.New("complete-forward requires an absolute verified bundle")
+	}
+	created, err := manager.Store.LatestEventByTransition(ctx, id, "created")
+	if err != nil || created == nil {
+		return nil, errors.New("original deployment identity is unavailable")
+	}
+	if created.Evidence["active_slot"] != transaction.PreviousSlot {
+		return nil, errors.New("original active slot does not match the transaction")
+	}
+	previousRelease, previousSource, previousAuthority, previousCapabilities, err := previousIdentityFromEvent(created)
+	if err != nil {
+		return nil, err
+	}
+	preflight, ok := manager.Runtime.(RuntimePreflight)
+	if !ok {
+		return nil, errors.New("complete-forward requires formal bundle preflight")
+	}
+	if err := preflight.Preflight(ctx, transaction.TargetSlot, bundle); err != nil {
+		return nil, err
+	}
+	observation, err := manager.observe(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := forwardRecoveryObservation(observation, *transaction, manager.Clock().UTC(), previousRelease, previousSource, previousAuthority); err != nil {
+		return nil, err
+	}
+	if _, err := manager.transition(ctx, id, transaction.Phase, PhaseControllerHandoff, "forward_recovery_started", map[string]any{
+		"previous_slot": transaction.PreviousSlot, "previous_release_id": previousRelease,
+		"previous_source_revision": previousSource, "previous_state_authority": previousAuthority,
+		"previous_state_capabilities": append([]string(nil), previousCapabilities...),
+		"previous_slot_stopped":       true,
+	}); err != nil {
+		return nil, err
+	}
+	if err := manager.Runtime.Stage(ctx, transaction.TargetSlot, bundle); err != nil {
+		return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, fmt.Errorf("forward stage failed: %w", err))
+	}
+	if err := manager.Runtime.Verify(ctx, transaction.TargetSlot, bundle); err != nil {
+		return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, fmt.Errorf("forward candidate verification failed: %w", err))
+	}
+	observation, err = manager.observe(ctx, id)
+	if err != nil {
+		return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, err)
+	}
+	target, targetOK := observation.Slots[transaction.TargetSlot]
+	if !targetOK || !target.ProcessUp || !target.ProcessReady || target.ControllerOwned || target.TrafficAccepting || target.ReleaseID == "" || target.SourceRevision == "" || target.StateEpoch == "" || target.StateAuthority != previousAuthority || !capabilitySuperset(target.StateCapabilities, previousCapabilities) {
+		return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, errors.New("forward candidate identity or state compatibility was not verified"))
+	}
+	if err := manager.transitionAfterEffect(ctx, id, PhaseControllerHandoff, PhaseControllerHandoff, "forward_candidate_verified", map[string]any{
+		"release_id": target.ReleaseID, "source_revision": target.SourceRevision,
+		"state_epoch": target.StateEpoch, "state_authority": target.StateAuthority,
+		"state_capabilities": append([]string(nil), target.StateCapabilities...),
+	}); err != nil {
+		return nil, err
+	}
+	lease, err := manager.newLease(ctx, transaction.TargetSlot, transaction.Generation)
+	if err != nil {
+		return nil, fmt.Errorf("allocate forward recovery controller lease: %w", err)
+	}
+	if err := manager.Runtime.GrantController(ctx, transaction.TargetSlot, lease); err != nil {
+		return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, fmt.Errorf("grant the forward recovery controller: %w", err))
+	}
+	parentContext := ctx
+	stopRenewal := func() error { return nil }
+	if _, supported := manager.Runtime.(interface {
+		RenewTransactionLease(context.Context, controllerrole.Lease) (controllerrole.Lease, error)
+	}); supported {
+		ctx, stopRenewal = manager.beginTransactionRenewal(ctx, lease)
+	}
+	defer stopRenewal()
+	fail := func(cause error) (*store.Transaction, error) {
+		_ = stopRenewal()
+		return nil, manager.effectFailure(parentContext, id, PhaseControllerHandoff, cause)
+	}
+	if err := manager.waitForReady(ctx, id, transaction.TargetSlot); err != nil {
+		return fail(fmt.Errorf("forward recovery readiness was not verified: %w", err))
+	}
+	if err := manager.Runtime.EnableTraffic(ctx, transaction.TargetSlot); err != nil {
+		return fail(fmt.Errorf("forward recovery traffic role was not enabled: %w", err))
+	}
+	if err := manager.Runtime.SwitchActive(ctx, transaction.TargetSlot); err != nil {
+		return fail(err)
+	}
+	observation, err = manager.observe(ctx, id)
+	if err != nil {
+		return fail(err)
+	}
+	target = observation.Slots[transaction.TargetSlot]
+	previous, previousOK := observation.Slots[transaction.PreviousSlot]
+	previousStopped := previousOK && !previous.ProcessUp && !previous.ProcessReady && !previous.ControllerOwned && !previous.TrafficAccepting && previous.InFlightRequests == 0 && previous.NativeWorkers == 0 && previous.PendingOperations == 0
+	if !validObservation(observation, manager.Clock().UTC()) || observation.ActiveSlot != transaction.TargetSlot || observation.ControllerSlot != transaction.TargetSlot ||
+		!target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || !target.TrafficAccepting ||
+		target.ReleaseID == "" || target.SourceRevision == "" || target.StateEpoch == "" || target.StateAuthority != previousAuthority ||
+		!capabilitySuperset(target.StateCapabilities, previousCapabilities) || !previousStopped {
+		return fail(errors.New("forward recovery outcome was not verified"))
+	}
+	if err := stopRenewal(); err != nil {
+		return fail(err)
+	}
+	ctx = parentContext
+	if err := manager.transitionAfterEffect(ctx, id, PhaseControllerHandoff, PhaseFinalize, "forward_recovered", map[string]any{
+		"active_slot": transaction.TargetSlot, "previous_slot_stopped": true, "lease_id": lease.LeaseID,
+	}); err != nil {
+		return nil, err
+	}
+	manager.startupFenced = false
+	return manager.Store.Get(ctx, id)
+}
+
+func forwardRecoveryObservation(observation RuntimeSnapshot, transaction store.Transaction, now time.Time, previousRelease, previousSource, previousAuthority string) error {
+	if !validObservation(observation, now) {
+		return errors.New("complete-forward requires a fresh consistent observation")
+	}
+	if observation.ActiveSlot != transaction.PreviousSlot || observation.ControllerSlot != "none" {
+		return errors.New("complete-forward requires the original active slot with no controller")
+	}
+	for _, slot := range []string{"blue", "green"} {
+		current := observation.Slots[slot]
+		if current.ControllerOwned || current.TrafficAccepting {
+			return errors.New("complete-forward requires both slots fenced from controller and traffic")
+		}
+	}
+	previous, previousOK := observation.Slots[transaction.PreviousSlot]
+	if !previousOK || previous.ProcessUp || previous.ProcessReady || previous.InFlightRequests != 0 || previous.NativeWorkers != 0 || previous.PendingOperations != 0 {
+		return errors.New("complete-forward requires the previous slot stopped and idle")
+	}
+	if previous.ReleaseID != "" && previous.ReleaseID != previousRelease || previous.SourceRevision != "" && previous.SourceRevision != previousSource {
+		return errors.New("complete-forward observed an unexpected previous release identity")
+	}
+	if previous.StateAuthority != "" && previous.StateAuthority != previousAuthority {
+		return errors.New("complete-forward observed an unexpected previous state authority")
+	}
+	target, targetOK := observation.Slots[transaction.TargetSlot]
+	if !targetOK {
+		return errors.New("complete-forward requires an observed target slot")
+	}
+	if target.ProcessUp && (!target.ProcessReady || !target.CountersKnown || target.InFlightRequests != 0 || target.NativeWorkers != 0 || target.PendingOperations != 0) {
+		return errors.New("complete-forward target slot is not quiescent")
+	}
+	return nil
+}
+
+func capabilitySuperset(current, required []string) bool {
+	if len(current) < len(required) || len(current) == 0 {
+		return false
+	}
+	available := make(map[string]struct{}, len(current))
+	for _, capability := range current {
+		available[capability] = struct{}{}
+	}
+	for _, capability := range required {
+		if _, ok := available[capability]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (manager *Manager) migrationSourceEvidence(ctx context.Context, id string) (state.SQLiteMigrationEvidence, bool, error) {
@@ -1161,11 +1581,7 @@ func (manager *Manager) verifiedCandidateIdentity(ctx context.Context, id string
 	return releaseID, sourceRevision, stateAuthority, capabilities, nil
 }
 
-func (manager *Manager) verifiedPreviousIdentity(ctx context.Context, id string) (string, string, string, []string, error) {
-	event, err := manager.Store.LatestEventByTransition(ctx, id, "created")
-	if err != nil {
-		return "", "", "", nil, fmt.Errorf("read rollback target identity: %w", err)
-	}
+func previousIdentityFromEvent(event *store.PhaseEvent) (string, string, string, []string, error) {
 	if event == nil {
 		return "", "", "", nil, errors.New("rollback target identity is missing")
 	}
@@ -1177,6 +1593,20 @@ func (manager *Manager) verifiedPreviousIdentity(ctx context.Context, id string)
 		return "", "", "", nil, errors.New("rollback target identity is incomplete")
 	}
 	return releaseID, sourceRevision, stateAuthority, capabilities, nil
+}
+
+func (manager *Manager) verifiedPreviousIdentity(ctx context.Context, id string) (string, string, string, []string, error) {
+	event, err := manager.Store.LatestEvent(ctx, id, PhaseStage, "retry_stage_prepared")
+	if err != nil {
+		return "", "", "", nil, fmt.Errorf("read retry-stage checkpoint: %w", err)
+	}
+	if event == nil {
+		event, err = manager.Store.LatestEventByTransition(ctx, id, "created")
+	}
+	if err != nil {
+		return "", "", "", nil, fmt.Errorf("read rollback target identity: %w", err)
+	}
+	return previousIdentityFromEvent(event)
 }
 
 func (manager *Manager) failure(ctx context.Context, id, phase string, cause error) error {

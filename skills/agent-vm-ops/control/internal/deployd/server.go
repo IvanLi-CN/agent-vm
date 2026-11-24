@@ -221,6 +221,12 @@ type request struct {
 	Action        string `json:"action"`
 }
 
+type recoverRequest struct {
+	TransactionID string `json:"transaction_id"`
+	Action        string `json:"action"`
+	Bundle        string `json:"bundle"`
+}
+
 func (server *Server) plan(c *gin.Context) {
 	var value request
 	if !decodeRequest(c, &value) {
@@ -311,8 +317,30 @@ func (server *Server) rollback(c *gin.Context) {
 }
 
 func (server *Server) recover(c *gin.Context) {
-	var value request
+	var value recoverRequest
 	if !decodeRequest(c, &value) {
+		return
+	}
+	if value.TransactionID == "" || value.Action == "" {
+		writeError(c, http.StatusBadRequest, "invalid_request", "recovery transaction_id and action are required")
+		return
+	}
+	if (value.Action == "complete-forward") != (value.Bundle != "") {
+		writeError(c, http.StatusBadRequest, "invalid_request", "only complete-forward accepts a bundle")
+		return
+	}
+	if value.Action == "complete-forward" {
+		transaction, err := server.Manager.CompleteForward(c.Request.Context(), value.TransactionID, value.Bundle)
+		if err != nil {
+			slog.Warn("deployment forward recovery rejected", "transaction_id", value.TransactionID, "error", err)
+			code := "recover_rejected"
+			if errors.Is(err, ErrUncertain) {
+				code = "state_unverified"
+			}
+			writeTransactionErrorForID(c, http.StatusConflict, code, value.TransactionID, err)
+			return
+		}
+		writeOK(c, publicTransaction(*transaction))
 		return
 	}
 	transaction, err := server.Manager.Recover(c.Request.Context(), value.TransactionID, value.Action)

@@ -131,7 +131,7 @@ agent-vm-deploy install --config <输入> --bundle <正式产品包> \
 
 命令先核对正式发布和验收记录，再使用现有蓝绿事务准备并激活候选槽。命令返回事务 ID 后如果报错，先用 `agent-vm-deploy transaction --transaction <ID>` 检查原事务和当前槽位，避免重新发起切换。只有部署控制服务已用专用账户接管并确认新槽持有原状态权威，命令才报告迁移完成。
 
-候选包的 `deployment_contract` major 在 stage 前由部署控制服务预检；缺失字段按 legacy v1 兼容，major 不兼容时不创建事务、不启动候选。普通更新和后续事务操作都使用部署控制服务对应的 CLI：全新安装使用 `/opt/agent-vm-native/bin/agent-vm-deploy`；完成旧安装账户迁移后使用 `/opt/agent-vm-native/maintenance/agent-vm-deploy`。以下命令在控制宿主执行，先按安装方式设置 `deploy_cli`。默认由控制宿主下载并核对当前架构的正式发布包：
+候选包的 `deployment_contract` major 在 stage 前由部署控制服务预检；缺失字段按 legacy v1 兼容，major 不兼容时不创建事务、不启动候选。普通更新和后续事务操作都使用部署控制服务对应的 CLI：全新安装使用 `/opt/agent-vm-native/bin/agent-vm-deploy`；完成旧安装账户迁移后使用 `/opt/agent-vm-native/maintenance/agent-vm-deploy`。以下命令在控制宿主执行，先按安装方式设置 `deploy_cli`。`agent-vm-deploy update` 是完整蓝绿 release transaction，并自行协调 stage、controller handoff 与 drain；不得在它之前另行进入维护 drain。若已有独立维护 drain owner，必须先由该原 owner 安全退出且保持 traffic 关闭，否则 release transaction 会发生 ownership conflict。默认由控制宿主下载并核对当前架构的正式发布包：
 
 ```sh
 deploy_cli=/opt/agent-vm-native/bin/agent-vm-deploy
@@ -174,9 +174,35 @@ sudo "$deploy_cli" recover --transaction '<原事务ID>' --action rollback
 sudo "$deploy_cli" transaction --transaction '<原事务ID>' --json
 ```
 
-只有 active 已切到原候选且候选产物、状态权威、进程与旧槽静止证据均可重新验证时，才可选择 `recover --transaction '<原事务ID>' --action finalize` 完成原切换。active 尚不存在的首次初始化使用[首次安装恢复](install.md)中的 `resume-bootstrap`，不能互换。证据不足时保持 fencing，不得手工改写业务状态或部署事务。
+只有 active 已切到原候选且候选产物、状态权威、进程与旧槽静止证据均可重新验证时，才可选择 `recover --transaction <原事务ID> --action finalize` 完成原切换。active 尚不存在的首次初始化使用[首次安装恢复](install.md)中的 `resume-bootstrap`，不能互换。证据不足时保持 fencing，不得手工改写业务状态或部署事务。
 
-`agent_vm_cutover.sh --dry-run` 只用于验证隔离布局和 active-link guard，不是蓝绿事务权威，也不能证明 controller 交接、流量排空或 native quiescence。
+如果原 transaction 仍在 `stage` phase 且已有 `stage_effect_started` 与可验证 recovery point，可用受限 `retry-stage` 复用原 transaction/bundle/recovery point；该动作只重新 stage 并 verify，成功后停在 `controller_handoff`，不恢复 snapshot、不切换 active、不授予 traffic。确认原 transaction 为 active/controller_handoff 后，再显式 activate 同一 transaction ID：
+
+```sh
+sudo "$deploy_cli" recover --transaction '<原事务ID>' --action retry-stage
+sudo "$deploy_cli" transaction --transaction '<原事务ID>' --json
+sudo "$deploy_cli" activate --transaction '<原事务ID>'
+```
+
+如果上一槽位的旧 release 已经无法读取当前数据库能力集合、重新启动必然失败，原事务只能用受限 forward 恢复继续：确认当前 `active` 槽位已停止且两个槽位都不持有 controller 或 traffic role 后，用同一 transaction ID 和正式完整包执行 `complete-forward`。该动作会重新 stage、verify 原目标槽位，授予唯一 controller，切换 `active`，然后 finalize 原事务；它不恢复业务数据库，也不接受其他目标槽位。
+
+```sh
+sudo "$deploy_cli" recover --transaction '<原事务ID>' --action complete-forward --bundle /protected/path/release.tar
+sudo "$deploy_cli" transaction --transaction '<原事务ID>' --json
+```
+
+若活动槽位仍有另一 `release-*` drain owner，先由该原 owner 使用保留当前 traffic role 的路径退出；不得以新 transaction 接管该 owner。`retry-stage` 的前置观测、恢复点复用和 fencing 约束见[Deployd 合同](../../docs/specs/agent-vm/contracts/deployment-controller.md#恢复与验证)。
+
+如果 maintenance drain 尚未退出，原 owner 可通过固定 root request UDS 使用其同一 session 发送 drain-exit，并显式保留 traffic role；不得以普通 drain-exit 重新开放一个尚无 controller 的槽位：
+
+```sh
+printf '%s\n' '{"protocol":4,"action":"drain-exit","session_id":"<原release-maintenance-session>","operation_id":"drain-exit-preserve-<唯一ID>","generation":0,"preserve_traffic":true}' | \
+  sudo /opt/agent-vm-native/bin/agent-vm-server request --socket /run/agent-vm-native/control.sock
+```
+
+确认响应 `ok=true`、`draining=false`，并重新读取 status 确认 `traffic_accepting=false`、`controller_slot=none` 后，才可执行 `retry-stage`。
+
+`agent_vm_cutover.sh --dry-run` 只用于验证隔离布局和 active-link guard，不是蓝绿事务权威，也不能证明 controller 交接、流量排空或 native quiescence.
 
 ## 恢复材料和清理
 

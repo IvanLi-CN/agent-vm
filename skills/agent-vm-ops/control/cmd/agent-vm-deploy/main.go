@@ -108,6 +108,10 @@ func run(args []string) error {
 		switch {
 		case command == "migrate":
 			*timeoutSeconds = 9000
+		case command == "recover" && *action == "retry-stage":
+			*timeoutSeconds = 900
+		case command == "recover" && *action == "complete-forward":
+			*timeoutSeconds = 900
 		case command == "rollback" || (command == "recover" && *action == "rollback"):
 			*timeoutSeconds = 480
 		default:
@@ -160,7 +164,16 @@ func run(args []string) error {
 		if *id == "" || *action == "" {
 			return errors.New("recover requires --transaction and --action")
 		}
-		method, path, body = "POST", "/v1/recover", map[string]any{"transaction_id": *id, "action": *action}
+		request := map[string]any{"transaction_id": *id, "action": *action}
+		if *action == "complete-forward" {
+			if *bundle == "" {
+				return errors.New("recover --action complete-forward requires --bundle")
+			}
+			request["bundle"] = *bundle
+		} else if *bundle != "" {
+			return errors.New("only recover --action complete-forward accepts --bundle")
+		}
+		method, path, body = "POST", "/v1/recover", request
 	case "migrate":
 		method, path, body = "POST", "/v1/migrate", map[string]any{}
 	default:

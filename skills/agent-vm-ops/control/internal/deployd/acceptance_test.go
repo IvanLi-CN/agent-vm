@@ -63,13 +63,16 @@ func TestServeUDSRefusesLiveAndReplacesStaleSocket(t *testing.T) {
 }
 
 type acceptanceRuntime struct {
-	mu             sync.Mutex
-	active         string
-	slots          map[string]SlotObservation
-	draining       map[string]bool
-	traffic        map[string]bool
-	uncertain      bool
-	stageUncertain bool
+	mu                 sync.Mutex
+	active             string
+	slots              map[string]SlotObservation
+	draining           map[string]bool
+	traffic            map[string]bool
+	uncertain          bool
+	stageUncertain     bool
+	unknownCounters    bool
+	stageCalls         int
+	capabilitiesBySlot map[string][]string
 }
 
 func newAcceptanceRuntime() *acceptanceRuntime {
@@ -91,12 +94,16 @@ func (runtime *acceptanceRuntime) Observe(context.Context) (RuntimeSnapshot, err
 	slots := make(map[string]SlotObservation, len(runtime.slots))
 	for slot, value := range runtime.slots {
 		value.TrafficAccepting = runtime.traffic[slot] && !runtime.draining[slot]
+		value.Draining = runtime.draining[slot]
 		value.ReleaseID = "release-" + slot
 		value.SourceRevision = "revision-1"
 		value.StateEpoch = "epoch-1"
 		value.StateAuthority = "authority-1"
 		value.StateCapabilities = []string{"reads@1", "writes@1"}
-		value.CountersKnown = true
+		if capabilities, ok := runtime.capabilitiesBySlot[slot]; ok {
+			value.StateCapabilities = append([]string(nil), capabilities...)
+		}
+		value.CountersKnown = !runtime.unknownCounters
 		value.ObservedUnix = now.Unix()
 		slots[slot] = value
 	}
@@ -128,6 +135,7 @@ func (runtime *acceptanceRuntime) Observe(context.Context) (RuntimeSnapshot, err
 func (runtime *acceptanceRuntime) Stage(_ context.Context, slot, _ string) error {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
+	runtime.stageCalls++
 	if runtime.stageUncertain {
 		return &UncertainError{Cause: errors.New("acceptance stage response was interrupted")}
 	}
