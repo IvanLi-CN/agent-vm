@@ -26,7 +26,6 @@ import (
 
 var errBackupStorageExhausted = errors.New("backup_storage_exhausted")
 
-const recoveryRetention = 30 * 24 * time.Hour
 const recoveryRecordReserve = 4096
 
 type recoveryPointCreator interface {
@@ -59,10 +58,9 @@ type recoveryPointReport struct {
 }
 
 type recoveryPointStatus struct {
-	BudgetUnits   int                   `json:"budget_units"`
-	Total         int                   `json:"total"`
-	RetentionDays int64                 `json:"retention_days"`
-	Points        []recoveryPointReport `json:"points"`
+	BudgetUnits int                   `json:"budget_units"`
+	Total       int                   `json:"total"`
+	Points      []recoveryPointReport `json:"points"`
 }
 
 func (manager *Manager) usesRecoveryPoints() bool {
@@ -147,8 +145,11 @@ func (runtime *HostRuntime) CreateRecoveryPoint(ctx context.Context, operation, 
 		}
 	}
 	if len(stored) == recoveryPointBudget {
+		// Budget relief protects the newest two points, leases, the rollback
+		// target and unfinished transactions. Age alone never blocks it: a
+		// point outside those guarantees carries no recovery role.
 		oldest := stored[0].recoveryPoint
-		if now.Before(oldest.Created.Add(recoveryRetention)) || now.Before(oldest.LeaseUntil) || protected[oldest.Operation] {
+		if now.Before(oldest.LeaseUntil) || protected[recoveryPointKey(oldest.Operation, oldest.Purpose)] {
 			return errBackupStorageExhausted
 		}
 		if err := removeRecoveryPoint(runtime.Config.Migration.RecoveryDirectory, root, oldest); err != nil {
@@ -295,7 +296,7 @@ func (manager *Manager) RecoveryPoints() (recoveryPointStatus, error) {
 		return recoveryPointStatus{}, err
 	}
 	now := manager.Clock().UTC()
-	status := recoveryPointStatus{BudgetUnits: recoveryPointBudget, Total: len(points), RetentionDays: manager.retentionDays(), Points: make([]recoveryPointReport, 0, len(points))}
+	status := recoveryPointStatus{BudgetUnits: recoveryPointBudget, Total: len(points), Points: make([]recoveryPointReport, 0, len(points))}
 	for index, point := range points {
 		status.Points = append(status.Points, recoveryPointReport{
 			ID: point.ID, Operation: point.Operation, Purpose: point.Purpose, Created: point.Created,
@@ -366,10 +367,6 @@ func recoveryPointKey(operation, purpose string) string {
 	return operation + "\x00" + purpose
 }
 
-func (manager *Manager) retentionDays() int64 {
-	return int64(recoveryRetention / (24 * time.Hour))
-}
-
 func (manager *Manager) failureEvidence(ctx context.Context, id string) (map[string]any, error) {
 	evidence, err := manager.Store.LatestFailureEvidence(ctx, id)
 	if err != nil || evidence == nil {
@@ -394,9 +391,6 @@ func recoveryPointBlockers(point recoveryPoint, index, total int, protected map[
 	}
 	if protected[recoveryPointKey(point.Operation, point.Purpose)] {
 		blockers = append(blockers, "referenced")
-	}
-	if now.Before(point.Created.Add(recoveryRetention)) {
-		blockers = append(blockers, "retention")
 	}
 	return blockers
 }

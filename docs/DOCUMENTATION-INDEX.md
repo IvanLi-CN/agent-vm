@@ -115,6 +115,8 @@
 - `docs/adr/0054-agent-vm-deployment-input-and-recovery-policy.md`
 - [root SSH 请求身份](adr/0055-root-ssh-request-identity.md)：已接受的安全边界决定，通过本索引阅读，未作为独立站点导航。
 - [VM 保留与租约区间](adr/0056-agent-vm-vm-hold-and-lease-bands.md)：已接受的生命周期与准入决定，定义保留状态、动作矩阵、租约区间和受保护销毁确认。
+- [状态标记不再是准入条件](adr/0057-agent-vm-state-markers-are-informational.md)：已接受的部署面决定，状态标记只作观测，不阻断启动、激活、回滚或恢复。
+- [恢复点预算按角色释放](adr/0058-agent-vm-recovery-point-budget-relief.md)：已接受的保留决定，最旧恢复点的可回收性由引用与租约决定，不再由年龄决定。
 
 ### 提案：索引访问
 
