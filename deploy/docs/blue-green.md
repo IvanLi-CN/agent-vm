@@ -184,6 +184,13 @@ sudo "$deploy_cli" transaction --transaction '<原事务ID>' --json
 sudo "$deploy_cli" activate --transaction '<原事务ID>'
 ```
 
+如果上一槽位的旧 release 已经无法读取当前数据库能力集合、重新启动必然失败，原事务只能用受限 forward 恢复继续：确认当前 `active` 槽位已停止且两个槽位都不持有 controller 或 traffic role 后，用同一 transaction ID 和正式完整包执行 `complete-forward`。该动作会重新 stage、verify 原目标槽位，授予唯一 controller，切换 `active`，然后 finalize 原事务；它不恢复业务数据库，也不接受其他目标槽位。
+
+```sh
+sudo "$deploy_cli" recover --transaction '<原事务ID>' --action complete-forward --bundle /protected/path/release.tar
+sudo "$deploy_cli" transaction --transaction '<原事务ID>' --json
+```
+
 若活动槽位仍有另一 `release-*` drain owner，先由该原 owner 使用保留当前 traffic role 的路径退出；不得以新 transaction 接管该 owner。`retry-stage` 的前置观测、恢复点复用和 fencing 约束见[Deployd 合同](../../docs/specs/agent-vm/contracts/deployment-controller.md#恢复与验证)。
 
 如果 maintenance drain 尚未退出，原 owner 可通过固定 root request UDS 使用其同一 session 发送 drain-exit，并显式保留 traffic role；不得以普通 drain-exit 重新开放一个尚无 controller 的槽位：

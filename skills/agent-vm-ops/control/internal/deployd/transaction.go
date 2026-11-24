@@ -975,6 +975,175 @@ func stageRetryCheckpointMatches(evidence map[string]any, previous SlotObservati
 		sameStateCapabilities(capabilities, previous.StateCapabilities) && pointID == point.ID && pointDigest == point.SHA256 && pointBoundary == point.Boundary
 }
 
+// CompleteForward finishes a fenced deployment transaction with a verified
+// candidate when the previous release can no longer start against the current
+// state authority. It installs caller-supplied, preflight-verified bytes only
+// into the original target slot, proves the incumbent is stopped and idle,
+// grants the sole controller role, enables traffic and switches the active
+// link. It never restores, replaces or deletes business state, and it refuses
+// while any slot still holds a role.
+func (manager *Manager) CompleteForward(ctx context.Context, id, bundle string) (*store.Transaction, error) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	transaction, err := manager.Store.Get(ctx, id)
+	if err != nil || transaction == nil {
+		return transaction, errOrNotFound(err, id, transaction)
+	}
+	if transaction.State != "needs_recovery" || !transaction.RecoveryRequired {
+		return nil, errors.New("complete-forward requires a transaction in needs_recovery")
+	}
+	switch transaction.Phase {
+	case PhaseStage, PhaseStandbyValidation, PhaseControllerHandoff, PhaseRollback:
+	default:
+		return nil, fmt.Errorf("complete-forward is not allowed in phase %s", transaction.Phase)
+	}
+	if validSlot(transaction.TargetSlot) != nil || validSlot(transaction.PreviousSlot) != nil || transaction.TargetSlot == transaction.PreviousSlot {
+		return nil, errors.New("complete-forward requires distinct fixed slots")
+	}
+	if bundle == "" || !strings.HasPrefix(bundle, "/") {
+		return nil, errors.New("complete-forward requires an absolute verified bundle")
+	}
+	created, err := manager.Store.LatestEventByTransition(ctx, id, "created")
+	if err != nil || created == nil {
+		return nil, errors.New("original deployment identity is unavailable")
+	}
+	if created.Evidence["active_slot"] != transaction.PreviousSlot {
+		return nil, errors.New("original active slot does not match the transaction")
+	}
+	previousRelease, previousSource, previousAuthority, previousCapabilities, err := previousIdentityFromEvent(created)
+	if err != nil {
+		return nil, err
+	}
+	preflight, ok := manager.Runtime.(RuntimePreflight)
+	if !ok {
+		return nil, errors.New("complete-forward requires formal bundle preflight")
+	}
+	if err := preflight.Preflight(ctx, transaction.TargetSlot, bundle); err != nil {
+		return nil, err
+	}
+	observation, err := manager.observe(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := forwardRecoveryObservation(observation, *transaction, manager.Clock().UTC(), previousRelease, previousSource, previousAuthority); err != nil {
+		return nil, err
+	}
+	if _, err := manager.transition(ctx, id, transaction.Phase, PhaseControllerHandoff, "forward_recovery_started", map[string]any{
+		"previous_slot": transaction.PreviousSlot, "previous_release_id": previousRelease,
+		"previous_source_revision": previousSource, "previous_state_authority": previousAuthority,
+		"previous_state_capabilities": append([]string(nil), previousCapabilities...),
+		"previous_slot_stopped":       true,
+	}); err != nil {
+		return nil, err
+	}
+	if err := manager.Runtime.Stage(ctx, transaction.TargetSlot, bundle); err != nil {
+		return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, fmt.Errorf("forward stage failed: %w", err))
+	}
+	if err := manager.Runtime.Verify(ctx, transaction.TargetSlot, bundle); err != nil {
+		return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, fmt.Errorf("forward candidate verification failed: %w", err))
+	}
+	observation, err = manager.observe(ctx, id)
+	if err != nil {
+		return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, err)
+	}
+	target, targetOK := observation.Slots[transaction.TargetSlot]
+	if !targetOK || !target.ProcessUp || !target.ProcessReady || target.ControllerOwned || target.TrafficAccepting || target.ReleaseID == "" || target.SourceRevision == "" || target.StateEpoch == "" || target.StateAuthority != previousAuthority || !capabilitySuperset(target.StateCapabilities, previousCapabilities) {
+		return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, errors.New("forward candidate identity or state compatibility was not verified"))
+	}
+	if err := manager.transitionAfterEffect(ctx, id, PhaseControllerHandoff, PhaseControllerHandoff, "forward_candidate_verified", map[string]any{
+		"release_id": target.ReleaseID, "source_revision": target.SourceRevision,
+		"state_epoch": target.StateEpoch, "state_authority": target.StateAuthority,
+		"state_capabilities": append([]string(nil), target.StateCapabilities...),
+	}); err != nil {
+		return nil, err
+	}
+	lease, err := manager.newLease(ctx, transaction.TargetSlot, transaction.Generation)
+	if err != nil {
+		return nil, fmt.Errorf("allocate forward recovery controller lease: %w", err)
+	}
+	if err := manager.Runtime.GrantController(ctx, transaction.TargetSlot, lease); err != nil {
+		return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, fmt.Errorf("grant the forward recovery controller: %w", err))
+	}
+	parentContext := ctx
+	stopRenewal := func() error { return nil }
+	if _, supported := manager.Runtime.(interface {
+		RenewTransactionLease(context.Context, controllerrole.Lease) (controllerrole.Lease, error)
+	}); supported {
+		ctx, stopRenewal = manager.beginTransactionRenewal(ctx, lease)
+	}
+	defer stopRenewal()
+	fail := func(cause error) (*store.Transaction, error) {
+		_ = stopRenewal()
+		return nil, manager.effectFailure(parentContext, id, PhaseControllerHandoff, cause)
+	}
+	if err := manager.waitForReady(ctx, id, transaction.TargetSlot); err != nil {
+		return fail(fmt.Errorf("forward recovery readiness was not verified: %w", err))
+	}
+	if err := manager.Runtime.EnableTraffic(ctx, transaction.TargetSlot); err != nil {
+		return fail(fmt.Errorf("forward recovery traffic role was not enabled: %w", err))
+	}
+	if err := manager.Runtime.SwitchActive(ctx, transaction.TargetSlot); err != nil {
+		return fail(err)
+	}
+	observation, err = manager.observe(ctx, id)
+	if err != nil {
+		return fail(err)
+	}
+	target = observation.Slots[transaction.TargetSlot]
+	previous, previousOK := observation.Slots[transaction.PreviousSlot]
+	previousStopped := previousOK && !previous.ProcessUp && !previous.ProcessReady && !previous.ControllerOwned && !previous.TrafficAccepting && previous.InFlightRequests == 0 && previous.NativeWorkers == 0 && previous.PendingOperations == 0
+	if !validObservation(observation, manager.Clock().UTC()) || observation.ActiveSlot != transaction.TargetSlot || observation.ControllerSlot != transaction.TargetSlot ||
+		!target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || !target.TrafficAccepting ||
+		target.ReleaseID == "" || target.SourceRevision == "" || target.StateEpoch == "" || target.StateAuthority != previousAuthority ||
+		!capabilitySuperset(target.StateCapabilities, previousCapabilities) || !previousStopped {
+		return fail(errors.New("forward recovery outcome was not verified"))
+	}
+	if err := stopRenewal(); err != nil {
+		return fail(err)
+	}
+	ctx = parentContext
+	if err := manager.transitionAfterEffect(ctx, id, PhaseControllerHandoff, PhaseFinalize, "forward_recovered", map[string]any{
+		"active_slot": transaction.TargetSlot, "previous_slot_stopped": true, "lease_id": lease.LeaseID,
+	}); err != nil {
+		return nil, err
+	}
+	manager.startupFenced = false
+	return manager.Store.Get(ctx, id)
+}
+
+func forwardRecoveryObservation(observation RuntimeSnapshot, transaction store.Transaction, now time.Time, previousRelease, previousSource, previousAuthority string) error {
+	if !validObservation(observation, now) {
+		return errors.New("complete-forward requires a fresh consistent observation")
+	}
+	if observation.ActiveSlot != transaction.PreviousSlot || observation.ControllerSlot != "none" {
+		return errors.New("complete-forward requires the original active slot with no controller")
+	}
+	for _, slot := range []string{"blue", "green"} {
+		current := observation.Slots[slot]
+		if current.ControllerOwned || current.TrafficAccepting {
+			return errors.New("complete-forward requires both slots fenced from controller and traffic")
+		}
+	}
+	previous, previousOK := observation.Slots[transaction.PreviousSlot]
+	if !previousOK || previous.ProcessUp || previous.ProcessReady || previous.InFlightRequests != 0 || previous.NativeWorkers != 0 || previous.PendingOperations != 0 {
+		return errors.New("complete-forward requires the previous slot stopped and idle")
+	}
+	if previous.ReleaseID != "" && previous.ReleaseID != previousRelease || previous.SourceRevision != "" && previous.SourceRevision != previousSource {
+		return errors.New("complete-forward observed an unexpected previous release identity")
+	}
+	if previous.StateAuthority != "" && previous.StateAuthority != previousAuthority {
+		return errors.New("complete-forward observed an unexpected previous state authority")
+	}
+	target, targetOK := observation.Slots[transaction.TargetSlot]
+	if !targetOK {
+		return errors.New("complete-forward requires an observed target slot")
+	}
+	if target.ProcessUp && (!target.ProcessReady || !target.CountersKnown || target.InFlightRequests != 0 || target.NativeWorkers != 0 || target.PendingOperations != 0) {
+		return errors.New("complete-forward target slot is not quiescent")
+	}
+	return nil
+}
+
 func capabilitySuperset(current, required []string) bool {
 	if len(current) < len(required) || len(current) == 0 {
 		return false
