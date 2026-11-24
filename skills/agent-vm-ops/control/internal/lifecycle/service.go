@@ -3626,9 +3626,17 @@ func (s *Service) drain(ctx context.Context, value bool, request protocol.Reques
 		}
 		session := stringValue(request["session_id"])
 		// The first management-aware release may inherit a drain entered by
-		// the previous protocol-4 controller, which had no owner metadata.
-		if session == "" || !strings.HasPrefix(session, "release-") || (found && owner != "" && session != owner) {
-			return nil, protocol.NewError("permission_denied", "only the active release transaction may exit admission drain", nil)
+		// the previous protocol-4 controller, which had no owner metadata. Root
+		// operators may also force the exit; the decision and its owner are kept
+		// as durable evidence instead of being refused outright.
+		owned := session != "" && strings.HasPrefix(session, "release-") && (!found || owner == "" || session == owner)
+		if !owned {
+			if !requestBool(request, "force") {
+				return nil, protocol.NewError("permission_denied", "only the active release transaction may exit admission drain unless the request forces it", nil)
+			}
+			if err := s.setMeta(ctx, "drain_force_exit", session+"@"+nowString(s.Clock())+"<-"+owner); err != nil {
+				return nil, s.sqliteError(err)
+			}
 		}
 	}
 	if err := s.setMeta(ctx, "draining", boolString(value)); err != nil {

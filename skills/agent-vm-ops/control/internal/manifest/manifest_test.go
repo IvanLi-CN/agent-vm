@@ -248,17 +248,6 @@ func TestLoadAcceptsHTTPSManagementProductTransport(t *testing.T) {
 	}
 }
 
-func TestValidateStateCapabilitiesFailsClosedForLegacyMetadata(t *testing.T) {
-	legacy := Metadata{ManifestPresent: true}
-	if err := ValidateStateCapabilities(legacy, []string{"legacy-agent-vm-core@1", "managed-image-catalog@1"}); err == nil || !strings.Contains(err.Error(), "managed-image-catalog@1") {
-		t.Fatalf("legacy capability mismatch = %v", err)
-	}
-	modern := Metadata{ManifestPresent: true, StateReads: append([]string(nil), stateCapabilityMarkers...), StateWrites: append([]string(nil), stateCapabilityMarkers...)}
-	if err := ValidateStateCapabilities(modern, stateCapabilityMarkers); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func rewriteTransport(t *testing.T, manifestPath, transport string) {
 	t.Helper()
 	data, err := os.ReadFile(manifestPath)

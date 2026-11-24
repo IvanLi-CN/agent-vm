@@ -560,9 +560,6 @@ func (s *Store) BeginRollback(ctx context.Context, id, expectedPhase, phase, tra
 		if currentPhase != expectedPhase {
 			return fmt.Errorf("deployment phase conflict: expected %s, got %s", expectedPhase, currentPhase)
 		}
-		if rollbackUsed != 0 {
-			return errors.New("transaction rollback is already used")
-		}
 		var sequence int64
 		if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(sequence), 0) + 1 FROM deployment_phase_events WHERE transaction_id = ?", id).Scan(&sequence); err != nil {
 			return err

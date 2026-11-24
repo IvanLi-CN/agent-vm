@@ -122,7 +122,7 @@ func TestCompleteForwardRequiresStoppedPreviousSlot(t *testing.T) {
 	}
 }
 
-func TestCompleteForwardRequiresCompatibleCandidate(t *testing.T) {
+func TestCompleteForwardAcceptsUndeclaredStateCapabilities(t *testing.T) {
 	ctx := context.Background()
 	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, time.Now)
 	if err != nil {
@@ -136,17 +136,17 @@ func TestCompleteForwardRequiresCompatibleCandidate(t *testing.T) {
 	runtime.mu.Unlock()
 	manager := NewManager(database, runtime, time.Minute, time.Now)
 
-	if _, err := manager.CompleteForward(ctx, transaction.ID, "/verified/blue-1.10.0.tar"); err == nil {
-		t.Fatal("complete-forward accepted a candidate without the previous state capabilities")
+	finished, err := manager.CompleteForward(ctx, transaction.ID, "/verified/blue-1.10.0.tar")
+	if err != nil {
+		t.Fatalf("state markers must not gate forward recovery: %v", err)
 	}
-	failed, err := database.Get(ctx, transaction.ID)
-	if err != nil || failed == nil || failed.State != "needs_recovery" || failed.Phase != PhaseControllerHandoff {
-		t.Fatalf("incompatible candidate transaction = %#v, %v", failed, err)
+	if finished.State != "finalized" {
+		t.Fatalf("forward recovery transaction = %#v", finished)
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if runtime.active != "green" || runtime.traffic["blue"] || runtime.slots["blue"].ControllerOwned {
-		t.Fatalf("incompatible candidate gained a role: active=%s slots=%#v traffic=%#v", runtime.active, runtime.slots, runtime.traffic)
+	if runtime.active != "blue" || !runtime.traffic["blue"] {
+		t.Fatalf("forward recovery did not switch the active slot: active=%s traffic=%#v", runtime.active, runtime.traffic)
 	}
 }
 

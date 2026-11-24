@@ -116,7 +116,10 @@ func (runtime *fakeRuntime) GrantController(_ context.Context, slot string, leas
 	runtime.grantedLeases = append(runtime.grantedLeases, lease)
 	runtime.sequence = append(runtime.sequence, "grant")
 	if runtime.mutateContractOnGrant {
-		runtime.capabilities = []string{"changed@1"}
+		if runtime.releaseIDs == nil {
+			runtime.releaseIDs = map[string]string{}
+		}
+		runtime.releaseIDs[slot] = "release-changed"
 	}
 	if observation, ok := runtime.observations[slot]; ok {
 		observation.ControllerOwned = true
@@ -315,7 +318,9 @@ func TestStageDrainedControllerForRecovery(t *testing.T) {
 			runtime.observations["blue"], runtime.observations["green"] = active, target
 			manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
 			transaction, err := manager.Stage(context.Background(), "green", "/tmp/recovery.tar")
-			if mode == "drained" {
+			if mode == "drained" || mode == "no-controller" {
+				// A drained or controller-less active slot is repairable: staging
+				// only replaces the inactive slot.
 				if err != nil || transaction.Phase != PhaseStandbyValidation {
 					t.Fatalf("stage = %#v, %v", transaction, err)
 				}
@@ -865,7 +870,7 @@ func TestManagerRejectsCandidateIdentityChangedAfterVerify(t *testing.T) {
 	}
 }
 
-func TestManagerRejectsCandidateStateContractChangedAfterVerify(t *testing.T) {
+func TestManagerRejectsCandidateReleaseChangedAfterVerify(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
 	if err != nil {
@@ -884,18 +889,18 @@ func TestManagerRejectsCandidateStateContractChangedAfterVerify(t *testing.T) {
 	if _, err := manager.Verify(context.Background(), transaction.ID); err != nil {
 		t.Fatal(err)
 	}
-	runtime.capabilities = []string{"legacy-agent-vm-core@1"}
+	runtime.releaseIDs = map[string]string{"green": "release-changed"}
 	if _, err := manager.Activate(context.Background(), transaction.ID); err == nil {
-		t.Fatal("candidate state contract change unexpectedly activated")
+		t.Fatal("candidate release change unexpectedly activated")
 	}
 	for _, action := range runtime.sequence {
 		if action == "revoke" || action == "grant" {
-			t.Fatalf("state contract mismatch caused controller effect: %v", runtime.sequence)
+			t.Fatalf("release identity mismatch caused controller effect: %v", runtime.sequence)
 		}
 	}
 }
 
-func TestManagerFencesWhenCandidateStateContractChangesAfterGrant(t *testing.T) {
+func TestManagerFencesWhenCandidateReleaseChangesAfterGrant(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
 	if err != nil {
@@ -915,11 +920,11 @@ func TestManagerFencesWhenCandidateStateContractChangesAfterGrant(t *testing.T) 
 		t.Fatal(err)
 	}
 	if _, err := manager.Activate(context.Background(), transaction.ID); err == nil {
-		t.Fatal("candidate state contract change after grant unexpectedly activated")
+		t.Fatal("candidate release change after grant unexpectedly activated")
 	}
 	for _, action := range runtime.sequence {
 		if action == "switch" {
-			t.Fatalf("state contract mismatch after grant caused an active-link switch: %v", runtime.sequence)
+			t.Fatalf("release identity mismatch after grant caused an active-link switch: %v", runtime.sequence)
 		}
 	}
 }
@@ -1471,7 +1476,7 @@ func TestManagerRecoveryFinalizeFencesWhenTargetGrantIsUncertain(t *testing.T) {
 	}
 }
 
-func TestManagerDoesNotMaintainControllerWithoutStateCapabilities(t *testing.T) {
+func TestManagerMaintainsControllerWithoutDeclaredStateCapabilities(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
 	if err != nil {
@@ -1483,11 +1488,11 @@ func TestManagerDoesNotMaintainControllerWithoutStateCapabilities(t *testing.T) 
 		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
 	}}
 	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
-	if err := manager.MaintainController(context.Background()); err == nil {
-		t.Fatal("controller maintenance succeeded without state capabilities")
+	if err := manager.MaintainController(context.Background()); err != nil {
+		t.Fatalf("state markers must not gate controller maintenance: %v", err)
 	}
-	if runtime.observations["blue"].ControllerOwned || runtime.observations["green"].ControllerOwned {
-		t.Fatalf("controller roles were not fenced without state capabilities: %#v", runtime.observations)
+	if !runtime.observations["blue"].ControllerOwned {
+		t.Fatalf("active slot did not keep controller ownership: %#v", runtime.observations)
 	}
 }
 

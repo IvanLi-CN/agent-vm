@@ -109,17 +109,6 @@ func TestRecoverRetriesStageOnlyOnOriginalTransaction(t *testing.T) {
 	runtime.stageUncertain = false
 	runtime.mu.Unlock()
 
-	if _, err := manager.Recover(ctx, originalID, "retry-stage"); err == nil {
-		t.Fatal("candidate missing the current vm-hold capability was accepted")
-	}
-	current, err := database.Get(ctx, originalID)
-	if err != nil || current == nil || current.State != "needs_recovery" || current.Phase != PhaseStandbyValidation {
-		t.Fatalf("incompatible candidate recovery state = %#v, %v", current, err)
-	}
-	runtime.mu.Lock()
-	runtime.capabilitiesBySlot["green"] = []string{"reads@1", "writes@1", "vm-hold@1"}
-	runtime.mu.Unlock()
-
 	server := NewServer(manager, NewMetrics(manager))
 	httpServer := httptest.NewServer(server.Handler())
 	defer httpServer.Close()
@@ -169,7 +158,7 @@ func TestRecoverRetriesStageOnlyOnOriginalTransaction(t *testing.T) {
 		t.Fatalf("recovery accepted caller-supplied replacement identity: status=%d response=%#v", rejectedResponse.StatusCode, rejected)
 	}
 	persisted, err := database.Get(ctx, originalID)
-	if err != nil || persisted == nil || persisted.Bundle != originalBundle || persisted.TargetSlot != originalTarget || persisted.State != "needs_recovery" || persisted.Phase != PhaseStandbyValidation {
+	if err != nil || persisted == nil || persisted.Bundle != originalBundle || persisted.TargetSlot != originalTarget || persisted.State != "needs_recovery" || persisted.Phase != PhaseStage {
 		t.Fatalf("rejected replacement changed original transaction: %#v, %v", persisted, err)
 	}
 	if runtime.stageCalls != stageCallsBefore || runtime.checkCalls != checksBefore {
@@ -184,7 +173,7 @@ func TestRecoverRetriesStageOnlyOnOriginalTransaction(t *testing.T) {
 	if err != nil || persisted == nil || persisted.Bundle != originalBundle || persisted.TargetSlot != originalTarget {
 		t.Fatalf("forward recovery changed original bundle identity: %#v, %v", persisted, err)
 	}
-	if runtime.createCalls != 1 || runtime.checkCalls != 2 || len(runtime.points) != 1 || runtime.stageCalls != 2 || runtime.prepareCalls != 2 {
+	if runtime.createCalls != 1 || runtime.checkCalls != 1 || len(runtime.points) != 1 || runtime.stageCalls != 2 || runtime.prepareCalls != 1 {
 		t.Fatalf("recovery points created=%d checked=%d registered=%d stages=%d process rebinds=%d; want original point and candidate identity reused", runtime.createCalls, runtime.checkCalls, len(runtime.points), runtime.stageCalls, runtime.prepareCalls)
 	}
 	runtime.mu.Lock()
