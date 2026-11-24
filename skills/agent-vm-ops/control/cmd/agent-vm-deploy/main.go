@@ -419,19 +419,45 @@ func runMaintenanceBinary(args []string) error {
 		_, _ = os.Stdout.Write(append(encoded, '\n'))
 		return nil
 	}
-	if err := exec.Command("/usr/bin/systemctl", "restart", "agent-vm-deployd.service").Run(); err != nil {
-		return err
-	}
+	// The restart is issued by whichever binary is running, so the expected
+	// version is the installed file, not this process.
 	served, err := install.ServedDeployBinaryVersion()
 	if err != nil {
 		return err
 	}
-	if served != version {
-		return fmt.Errorf("deployd reports %s after restart, expected %s", served, version)
+	if err := exec.Command("/usr/bin/systemctl", "restart", "agent-vm-deployd.service").Run(); err != nil {
+		return err
 	}
-	encoded, _ := json.Marshal(map[string]any{"served_version": served, "next_action": "re-run status, doctor and admin status before claiming the update"})
+	if err := waitDeploydReady(30 * time.Second); err != nil {
+		return err
+	}
+	encoded, _ := json.Marshal(map[string]any{"served_version": served, "deployd_ready": true, "next_action": "re-run status, doctor and admin status before claiming the update"})
 	_, _ = os.Stdout.Write(append(encoded, '\n'))
 	return nil
+}
+
+// waitDeploydReady polls the socket so a crash-looping unit is not reported as
+// a successful restart.
+func waitDeploydReady(deadline time.Duration) error {
+	client := deployd.Client{Socket: deployd.Defaults().Socket, Timeout: 5 * time.Second}
+	until := time.Now().Add(deadline)
+	for {
+		payload, _, err := client.Call(context.Background(), "GET", "/v1/status", nil)
+		if err == nil && hasOKStatus(payload) {
+			return nil
+		}
+		if time.Now().After(until) {
+			return errors.New("deployd did not become ready after restart; inspect agent-vm-deployd.service")
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func hasOKStatus(payload []byte) bool {
+	var envelope struct {
+		OK bool `json:"ok"`
+	}
+	return json.Unmarshal(payload, &envelope) == nil && envelope.OK
 }
 
 const recoveryPointBudgetHint = 3
