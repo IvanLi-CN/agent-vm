@@ -67,3 +67,19 @@ func TestMigratedSlotProbesUseVerifiedMaintenanceBinary(t *testing.T) {
 		}
 	}
 }
+
+func TestDeployBinaryVersionReadsSelfReport(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent-vm-deploy")
+	// Real Go binaries embed the version literal; build a Go string table copy.
+	contents := []byte("\x7fELF\x00agent-vm-deploy/1.12.0\x00other\x00")
+	if err := os.WriteFile(path, contents, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	version, err := DeployBinaryVersion(path)
+	if err != nil || version != "agent-vm-deploy/1.12.0" {
+		t.Fatalf("version = %q, err = %v", version, err)
+	}
+	if _, err := DeployBinaryVersion(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("missing binary was accepted")
+	}
+}

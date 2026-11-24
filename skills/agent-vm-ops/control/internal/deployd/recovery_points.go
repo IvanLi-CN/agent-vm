@@ -37,6 +37,34 @@ type recoveryPointValidator interface {
 	ValidateRecoveryPoint(context.Context, string, string, string) (recoveryPoint, error)
 }
 
+// recoveryPointMaintainer exposes the budget to the operator CLI. Creating a
+// point prunes at most one point whose retention already expired; listing and
+// pruning let an operator reclaim budget before a deployment needs it.
+type recoveryPointMaintainer interface {
+	RecoveryPoints() ([]recoveryPoint, error)
+	PruneRecoveryPoints(time.Time, map[string]bool, int) ([]recoveryPoint, error)
+}
+
+const recoveryPointBudget = 3
+
+type recoveryPointReport struct {
+	ID         string    `json:"id"`
+	Operation  string    `json:"deployment_operation_id"`
+	Purpose    string    `json:"purpose"`
+	Created    time.Time `json:"created_at"`
+	LeaseUntil time.Time `json:"lease_until,omitempty"`
+	Size       int64     `json:"size"`
+	Eligible   bool      `json:"eligible"`
+	Blockers   []string  `json:"blockers"`
+}
+
+type recoveryPointStatus struct {
+	BudgetUnits   int                   `json:"budget_units"`
+	Total         int                   `json:"total"`
+	RetentionDays int64                 `json:"retention_days"`
+	Points        []recoveryPointReport `json:"points"`
+}
+
 func (manager *Manager) usesRecoveryPoints() bool {
 	runtime, ok := manager.Runtime.(recoveryPointCreator)
 	return ok && runtime.RecoveryAuthority() != ""
@@ -88,6 +116,11 @@ type recoveryPoint struct {
 	LeaseUntil time.Time `json:"lease_until,omitempty"`
 }
 
+type storedRecoveryPoint struct {
+	recoveryPoint
+	authorityMatches bool
+}
+
 func (runtime *HostRuntime) recoveryDirectory() string {
 	return filepath.Join(runtime.Config.Migration.RecoveryDirectory, "rqlite-recovery")
 }
@@ -104,41 +137,21 @@ func (runtime *HostRuntime) CreateRecoveryPoint(ctx context.Context, operation, 
 	if err != nil {
 		return err
 	}
-	all := points
-	points = nil
-	for _, point := range all {
-		if point.Authority != authority {
-			continue
-		}
-		points = append(points, point)
-		if point.Operation == operation && point.Purpose == purpose {
-			return validateRegisteredRecoveryPoint(ctx, root, point)
-		}
-	}
-	if len(points) > 3 {
+	stored := scopedRecoveryPoints(points, authority)
+	if len(stored) > recoveryPointBudget {
 		return errBackupStorageExhausted
 	}
-	if len(points) == 3 {
-		oldest := points[0]
+	for _, point := range stored {
+		if point.Operation == operation && point.Purpose == purpose {
+			return validateRegisteredRecoveryPoint(ctx, root, point.recoveryPoint)
+		}
+	}
+	if len(stored) == recoveryPointBudget {
+		oldest := stored[0].recoveryPoint
 		if now.Before(oldest.Created.Add(recoveryRetention)) || now.Before(oldest.LeaseUntil) || protected[oldest.Operation] {
 			return errBackupStorageExhausted
 		}
-		used, err := recoveryMaterialBytes(runtime.Config.Migration.RecoveryDirectory)
-		if err != nil {
-			return err
-		}
-		if maxMigrationSourceBytes-used < recoveryRecordReserve {
-			return errBackupStorageExhausted
-		}
-		// Persist the precise deletion target before removing its bytes so an
-		// interruption can finish only the deletion that was already approved.
-		if err := writeRecoveryRecord(root, "pruned-"+oldest.ID+".json", oldest); err != nil {
-			return err
-		}
-		if err := os.RemoveAll(filepath.Join(root, oldest.ID)); err != nil {
-			return err
-		}
-		if err := syncMigrationDirectory(root); err != nil {
+		if err := removeRecoveryPoint(runtime.Config.Migration.RecoveryDirectory, root, oldest); err != nil {
 			return err
 		}
 	}
@@ -261,6 +274,206 @@ func (runtime *HostRuntime) ValidateRecoveryPoint(ctx context.Context, operation
 		return empty, err
 	}
 	return *match, nil
+}
+
+func (manager *Manager) recoveryPointMaintainer() (recoveryPointMaintainer, bool) {
+	maintainer, ok := manager.Runtime.(recoveryPointMaintainer)
+	return maintainer, ok
+}
+
+func (manager *Manager) RecoveryPoints() (recoveryPointStatus, error) {
+	maintainer, ok := manager.recoveryPointMaintainer()
+	if !ok {
+		return recoveryPointStatus{}, errors.New("recovery points are unavailable")
+	}
+	points, err := maintainer.RecoveryPoints()
+	if err != nil {
+		return recoveryPointStatus{}, err
+	}
+	protected, err := manager.protectedRecoveryPoints()
+	if err != nil {
+		return recoveryPointStatus{}, err
+	}
+	now := manager.Clock().UTC()
+	status := recoveryPointStatus{BudgetUnits: recoveryPointBudget, RetentionDays: manager.retentionDays(), Points: make([]recoveryPointReport, 0, len(points))}
+	for index, point := range points {
+		status.Points = append(status.Points, recoveryPointReport{
+			ID: point.ID, Operation: point.Operation, Purpose: point.Purpose, Created: point.Created,
+			LeaseUntil: point.LeaseUntil, Size: point.Size,
+			Eligible: recoveryPointEligible(point, index, len(points), protected, now),
+			Blockers: recoveryPointBlockers(point, index, len(points), protected, now),
+		})
+	}
+	return status, nil
+}
+
+// PruneRecoveryPoints drops the retained points that can be reclaimed without
+// losing recovery capability. A budget of one retained point exists so a full
+// budget can always be reduced to the two points that the retention contract
+// keeps regardless of age.
+func (manager *Manager) PruneRecoveryPoints() ([]recoveryPointReport, error) {
+	maintainer, ok := manager.recoveryPointMaintainer()
+	if !ok {
+		return nil, errors.New("recovery points are unavailable")
+	}
+	protected, err := manager.protectedRecoveryPoints()
+	if err != nil {
+		return nil, err
+	}
+	now := manager.Clock().UTC()
+	target := len(protected)
+	// The latest two points and the rollback target never fall below this.
+	if target < 2 {
+		target = 2
+	}
+	pruned, err := maintainer.PruneRecoveryPoints(now, protected, target)
+	if err != nil {
+		return nil, err
+	}
+	reports := make([]recoveryPointReport, 0, len(pruned))
+	for _, point := range pruned {
+		reports = append(reports, recoveryPointReport{ID: point.ID, Operation: point.Operation, Purpose: point.Purpose, Created: point.Created, Size: point.Size, Eligible: true})
+	}
+	return reports, nil
+}
+
+// protectedRecoveryPoints maps the points the rollback path may still select,
+// so pruning cannot strand an unfinalized operation or the rollback target.
+// Points are matched per operation and purpose, never by operation alone.
+func (manager *Manager) protectedRecoveryPoints() (map[string]bool, error) {
+	ctx := context.WithoutCancel(context.Background())
+	protected := map[string]bool{}
+	active, err := manager.Store.ListActive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, transaction := range active {
+		for _, purpose := range []string{"stage", "rollback"} {
+			protected[recoveryPointKey(transaction.ID, purpose)] = true
+		}
+	}
+	rollbackTarget, err := manager.Store.LatestRollbackTarget(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if rollbackTarget != "" {
+		protected[recoveryPointKey(rollbackTarget, "stage")] = true
+	}
+	return protected, nil
+}
+
+func recoveryPointKey(operation, purpose string) string {
+	return operation + "\x00" + purpose
+}
+
+func (manager *Manager) retentionDays() int64 {
+	return int64(recoveryRetention / (24 * time.Hour))
+}
+
+func (manager *Manager) failureEvidence(ctx context.Context, id string) (map[string]any, error) {
+	evidence, err := manager.Store.LatestFailureEvidence(ctx, id)
+	if err != nil || evidence == nil {
+		return nil, err
+	}
+	detail := map[string]any{"phase": evidence.Phase, "code": evidence.Code, "recorded_at": evidence.CreatedAt}
+	for _, key := range []string{"message", "cause", "cause_type"} {
+		if value, ok := evidence.Payload[key].(string); ok {
+			detail[key] = value
+		}
+	}
+	return detail, nil
+}
+
+func recoveryPointBlockers(point recoveryPoint, index, total int, protected map[string]bool, now time.Time) []string {
+	blockers := make([]string, 0, 3)
+	if index >= total-2 {
+		blockers = append(blockers, "newest")
+	}
+	if point.LeaseUntil.After(now) {
+		blockers = append(blockers, "lease")
+	}
+	if protected[recoveryPointKey(point.Operation, point.Purpose)] {
+		blockers = append(blockers, "referenced")
+	}
+	if now.Before(point.Created.Add(recoveryRetention)) {
+		blockers = append(blockers, "retention")
+	}
+	return blockers
+}
+
+func recoveryPointEligible(point recoveryPoint, index, total int, protected map[string]bool, now time.Time) bool {
+	return len(recoveryPointBlockers(point, index, total, protected, now)) == 0
+}
+
+// RecoveryPoints returns the points of the configured authority, oldest first.
+func (runtime *HostRuntime) RecoveryPoints() ([]recoveryPoint, error) {
+	root := runtime.recoveryDirectory()
+	points, err := loadRecoveryPoints(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return []recoveryPoint{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	stored := scopedRecoveryPoints(points, runtime.RecoveryAuthority())
+	points = make([]recoveryPoint, 0, len(stored))
+	for _, point := range stored {
+		points = append(points, point.recoveryPoint)
+	}
+	return points, nil
+}
+
+// PruneRecoveryPoints removes the oldest eligible points while more than
+// target remain. It prunes one point at a time and stops at the first refusal.
+func (runtime *HostRuntime) PruneRecoveryPoints(now time.Time, protected map[string]bool, target int) ([]recoveryPoint, error) {
+	root := runtime.recoveryDirectory()
+	points, err := loadRecoveryPoints(root)
+	if err != nil {
+		return nil, err
+	}
+	stored := scopedRecoveryPoints(points, runtime.RecoveryAuthority())
+	reports := make([]recoveryPoint, 0, recoveryPointBudget)
+	for len(stored) > target {
+		oldest := stored[0].recoveryPoint
+		if !recoveryPointEligible(oldest, 0, len(stored), protected, now) {
+			break
+		}
+		if err := removeRecoveryPoint(runtime.Config.Migration.RecoveryDirectory, root, oldest); err != nil {
+			return reports, err
+		}
+		reports = append(reports, oldest)
+		stored = stored[1:]
+	}
+	return reports, nil
+}
+
+func scopedRecoveryPoints(points []recoveryPoint, authority string) []storedRecoveryPoint {
+	scoped := make([]storedRecoveryPoint, 0, len(points))
+	for _, point := range points {
+		if point.Authority == authority {
+			scoped = append(scoped, storedRecoveryPoint{recoveryPoint: point, authorityMatches: true})
+		}
+	}
+	return scoped
+}
+
+// removeRecoveryPoint persists the deletion target before its bytes, so an
+// interruption finishes only the deletion that was already approved.
+func removeRecoveryPoint(directory, root string, point recoveryPoint) error {
+	used, err := recoveryMaterialBytes(directory)
+	if err != nil {
+		return err
+	}
+	if maxMigrationSourceBytes-used < recoveryRecordReserve {
+		return errBackupStorageExhausted
+	}
+	if err := writeRecoveryRecord(root, "pruned-"+point.ID+".json", point); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(filepath.Join(root, point.ID)); err != nil {
+		return err
+	}
+	return syncMigrationDirectory(root)
 }
 
 func (runtime *HostRuntime) writeRecoveryMarker(ctx context.Context, client *http.Client, endpoint, id string) error {

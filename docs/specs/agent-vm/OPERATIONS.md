@@ -59,7 +59,7 @@ Backup 必须记录不早于最后可信提交的 coverage boundary；
 迁移源 SQLite snapshot/export、rqlite backup/snapshot、deployd `deployment.sqlite3` recovery copy（如有）、backup tail、manifest、tail-evidence 和 recovery authorization record 都是恢复材料。
 蓝绿部署的 `stage` 和显式 `rollback` 在改变槽位角色前，由部署控制服务创建并验证 rqlite 恢复点。激活失败后的自动补偿复用原事务的恢复点。切槽始终使用同一 rqlite，不恢复快照到现役数据库。
 
-同一 rqlite 业务状态权威最多保留三个已验证恢复点，蓝绿槽位共用计数；最新两个始终受保护。最旧的第三个满三十天，且没有有效租约、进行中的切换、当前回退目标或未完成部署事务保护时，才可按恢复点 ID 审计清理。数量或容量不足且无法清理时，返回 `backup_storage_exhausted`，当前槽继续服务。
+同一 rqlite 业务状态权威最多保留三个已验证恢复点，蓝绿槽位共用计数；最新两个始终受保护。最旧的第三个满三十天，且没有有效租约、进行中的切换、当前回退目标或未完成部署事务保护时，才可按恢复点 ID 审计清理。数量或容量不足且无法清理时，返回 `backup_storage_exhausted`，当前槽继续服务。运维者可先用 `agent-vm-deploy recovery-points` 查看每个点的 `blockers`，再用 `prune-recovery-points` 清理可清理的最旧点，不必手工移动目录。
 1 GiB 是实际占用上限，不是预分配空间，也不存在体积下限；
 小数据库按实际大小保留。
 迁移源 SQLite snapshot 计入字节预算，不计入三个 rqlite 恢复点；迁移 finalized、目标 rqlite 摘要完成校验后至少保留七天，完成标记中的保留截止时间是清理依据。

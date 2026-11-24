@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -87,6 +88,9 @@ func run(args []string) error {
 	}
 	if args[0] == "update" {
 		return runUpdate(args[1:])
+	}
+	if args[0] == "maintenance-binary" {
+		return runMaintenanceBinary(args[1:])
 	}
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -176,6 +180,10 @@ func run(args []string) error {
 		method, path, body = "POST", "/v1/recover", request
 	case "migrate":
 		method, path, body = "POST", "/v1/migrate", map[string]any{}
+	case "recovery-points":
+		method, path = "GET", "/v1/recovery-points"
+	case "prune-recovery-points":
+		method, path, body = "POST", "/v1/recovery-points/prune", map[string]any{}
 	default:
 		return fmt.Errorf("unknown deployd command %q", command)
 	}
@@ -306,8 +314,127 @@ func runUpdate(args []string) error {
 	if len(payload) == 0 || payload[len(payload)-1] != '\n' {
 		_, _ = os.Stdout.Write([]byte("\n"))
 	}
+	writeMaintenanceStatus(payload)
 	return nil
 }
+
+// writeMaintenanceStatus names the host actions that the blue-green
+// transaction does not perform. Without it a successful update silently leaves
+// the stable deployd binary on the previous release.
+func writeMaintenanceStatus(transactionPayload []byte) {
+	var envelope struct {
+		Value struct {
+			TargetSlot string `json:"target_slot"`
+		} `json:"value"`
+	}
+	if json.Unmarshal(transactionPayload, &envelope) != nil || envelope.Value.TargetSlot == "" {
+		return
+	}
+	maintenance := "current"
+	if served, err := install.ServedDeployBinaryVersion(); err == nil && served != "" && served != version {
+		maintenance = "pending"
+	}
+	maintenanceAction := "none"
+	if maintenance != "current" {
+		maintenanceAction = install.MaintenanceBinaryPath + ": install the release binary and restart agent-vm-deployd.service"
+	}
+	status := map[string]any{
+		"maintenance_binary":        maintenance,
+		"next_action":               maintenanceAction,
+		"deployed_slot":             envelope.Value.TargetSlot,
+		"slot_binary_version":       version,
+		"recovery_points":           recoveryPointSummary(transactionPayload),
+		"service_accounts_modified": false,
+	}
+	if served, err := install.ServedDeployBinaryVersion(); err == nil && served != "" {
+		status["maintenance_binary_version"] = served
+	}
+	encoded, _ := json.Marshal(status)
+	_, _ = os.Stderr.Write(append(encoded, '\n'))
+}
+
+func recoveryPointSummary(transactionPayload []byte) map[string]any {
+	summary := map[string]any{"count": 0, "budget": recoveryPointBudgetHint}
+	status, _, err := deployd.Client{Socket: deployd.Defaults().Socket, Timeout: 10 * time.Second}.Call(context.Background(), "GET", "/v1/recovery-points", nil)
+	if err != nil {
+		return summary
+	}
+	var envelope struct {
+		Value struct {
+			Total    int `json:"total"`
+			Budget   int `json:"budget_units"`
+			Eligible int
+			Points   []struct {
+				Eligible bool `json:"eligible"`
+			} `json:"points"`
+		} `json:"value"`
+	}
+	if json.Unmarshal(status, &envelope) != nil {
+		return summary
+	}
+	summary["count"] = envelope.Value.Total
+	if envelope.Value.Budget > 0 {
+		summary["budget"] = envelope.Value.Budget
+	}
+	for _, point := range envelope.Value.Points {
+		if point.Eligible {
+			summary["eligible"] = summary["eligible"].(int) + 1
+		}
+	}
+	if envelope.Value.Total >= envelope.Value.Budget {
+		summary["next_action"] = "agent-vm-deploy prune-recovery-points"
+	}
+	return summary
+}
+
+// runMaintenanceBinary separates the two steps a blue-green update never
+// performs: replacing the stable deployd executable and restarting its unit.
+// Splitting them keeps the transaction finished before deployd restarts.
+func runMaintenanceBinary(args []string) error {
+	flags := flag.NewFlagSet("maintenance-binary", flag.ContinueOnError)
+	product := flags.String("product", "", "extracted release product directory holding bin/agent-vm-deploy")
+	installOnly := flags.Bool("install", false, "replace the stable binary only")
+	restartOnly := flags.Bool("restart", false, "restart agent-vm-deployd.service only")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *installOnly == *restartOnly || (*installOnly && *product == "") || (*restartOnly && *product != "") {
+		return errors.New("maintenance-binary requires exactly one of --install/--product or --restart")
+	}
+	if *installOnly {
+		release, err := install.DeployBinaryVersion(filepath.Join(*product, "bin", "agent-vm-deploy"))
+		if err != nil {
+			return err
+		}
+		// Self-reported versions of parsed strings are soft evidence; the byte
+		// comparison that matters happened before staging.
+		if installed, err := install.DeployBinaryVersion(install.MaintenanceBinaryPath); err == nil && installed != version {
+			return fmt.Errorf("this binary is %s and the installed stable binary is %s; run the matching release binary", version, installed)
+		}
+		backup, err := install.InstallMaintenanceBinary(*product)
+		if err != nil {
+			return err
+		}
+		encoded, _ := json.Marshal(map[string]any{"maintenance_binary_version": release, "backup": backup})
+		_, _ = os.Stdout.Write(append(encoded, '\n'))
+		return nil
+	}
+	if err := exec.Command("/usr/bin/systemctl", "restart", "agent-vm-deployd.service").Run(); err != nil {
+		return err
+	}
+	served, err := install.ServedDeployBinaryVersion()
+	if err != nil {
+		return err
+	}
+	if served != version {
+		return fmt.Errorf("deployd reports %s after restart, expected %s", served, version)
+	}
+	encoded, _ := json.Marshal(map[string]any{"served_version": served, "next_action": "re-run status, doctor and admin status before claiming the update"})
+	_, _ = os.Stdout.Write(append(encoded, '\n'))
+	return nil
+}
+
+const recoveryPointBudgetHint = 3
 
 const orphanStagingAge = 24 * time.Hour
 

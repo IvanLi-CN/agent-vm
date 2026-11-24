@@ -228,11 +228,19 @@ root SSH 业务请求使用独立的 `/run/agent-vm-native/control.sock`，由 `
 
 安装器使用被固定服务端证书保护的 Incus TLS 身份，核对本机信任记录仅授权目标项目，再只读验证目标项目及其实例可读、默认项目对象返回 403。实例集合可以对无权访问的项目返回过滤后的空列表，不能用集合的成功响应证明越权或拒绝；默认项目对象可读、缺失或授权探测失败时仍拒绝安装。
 
-Unix-socket API 提供只读的 `status`、`transaction` 和 `plan` 操作，以及需要授权的 `verify`、`stage`、`activate`、`rollback`、`recover` 和一次性的 `migrate` 操作。每个变更请求都要携带或创建 transaction ID、release/bundle 标识、明确的目标槽位，并在提供时携带操作原因。Socket 检查 peer credentials，服务在产生文件系统、systemd 或 slot-role effect 前完成运维授权。不存在任意 shell、path、SQL 或 Incus passthrough。`migrate` 不是通用 rqlite passthrough；它只接受固定的首次迁移流程，不能由调用方提交任意 SQL、URL、文件路径或 systemd unit。
+Unix-socket API 提供只读的 `status`、`transaction`、`plan` 和 `recovery-points` 操作，以及需要授权的 `verify`、`stage`、`activate`、`rollback`、`recover`、`prune-recovery-points` 和一次性的 `migrate` 操作。每个变更请求都要携带或创建 transaction ID、release/bundle 标识、明确的目标槽位，并在提供时携带操作原因。Socket 检查 peer credentials，服务在产生文件系统、systemd 或 slot-role effect 前完成运维授权。不存在任意 shell、path、SQL 或 Incus passthrough。`migrate` 不是通用 rqlite passthrough；它只接受固定的首次迁移流程，不能由调用方提交任意 SQL、URL、文件路径或 systemd unit。
 
 CLI 永远不能直接编辑 `active`。响应丢失时，CLI 返回 deployd transaction ID 和 status；不能创建新事务来猜测 activation 或 rollback 是否发生。
 
 服务账户分离时，部署控制服务通过槽位 Unix socket 读取健康和部署观察、协调角色、管理部署自身的排空标记以及请求写入恢复点覆盖标记。槽位按 peer UID 和操作授权；部署账户不能执行实例变更或读取槽位任意快照。root 仍可运行运维 CLI。主服务通过独立的只读宿主 socket 获取目录池容量、镜像存储余量、共享网桥租约以及跨项目 Incus 操作是否静默。辅助入口从受保护的槽位配置读取目标，不接受调用方提供的路径、Incus 命令或项目名。观察失败时，依赖该证据的操作按原有规则拒绝继续。
+
+### 失败原因可见性
+
+phase 拒绝不能只返回 `stage_rejected` 一类公开码。带 transaction 的拒绝响应 MUST 同时携带 `reason`（按规定限长、清理控制字符、脱敏私有路径的原始 `cause`）和 `cause_type`；`status` 的活动事务和 `transaction` 响应 MUST 携带同一原因，即取自最近一条 `deployment_failure_evidence` 的 `failure.cause`。原因文本是诊断材料，不改变公开码的稳定性承诺。没有失败证据时可以省略原因字段，不能合成原因。
+
+### 恢复点预算的运维入口
+
+`recovery-points` 按创建时间升序返回当前状态权威的恢复点，包含 `budget_units`、`total`、每个点的 `created_at`，以及被判定为不可清理时的 `blockers`（`newest`、`lease`、`referenced`、`retention`）。`prune-recovery-points` 逐个删除最旧的可清理恢复点，直到剩余数量达到 `max(2, 活动事务数 + 1)`，遇到第一个不可清理点即停止，并返回每个被删除的点。两者都不创建恢复点、不读取业务库、不变更槽位角色，因此不需要续租 controller。可清理与创建时的严格判定等价：不在最新两个之内、无有效租约、不是任何未 finalized 事务或其 stage 恢复点、已满保留期且容量充足；删除仍先写 `pruned-<id>.json` 收据再删除字节。
 
 对于只接受同 UID 请求的历史槽位，部署控制服务在收到明确的 `peer_unauthorized` 后，可通过 systemd 按需启动的非 root 转接入口重发同一请求。入口只接受部署账户，只能访问固定蓝绿槽位，并确认目标进程使用主服务 UID。允许的方法和动作与当前槽位的跨账户接口一致；业务错误不会触发转接。
 

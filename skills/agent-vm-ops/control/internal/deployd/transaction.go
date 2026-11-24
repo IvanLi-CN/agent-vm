@@ -200,7 +200,19 @@ func (manager *Manager) Transaction(ctx context.Context, id string) (map[string]
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"transaction": transaction, "observation": observation}, nil
+	result := map[string]any{"transaction": transaction, "observation": observation}
+	// A non-final state always has a recorded cause; without it the operator
+	// sees only the phase and has to read the journal for the actual failure.
+	if transaction.State != "finalized" {
+		detail, err := manager.failureEvidence(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if detail != nil {
+			result["failure"] = detail
+		}
+	}
+	return result, nil
 }
 
 func (manager *Manager) Plan(ctx context.Context, targetSlot, bundle string) (map[string]any, error) {
