@@ -354,34 +354,42 @@ func writeMaintenanceStatus(transactionPayload []byte) {
 }
 
 func recoveryPointSummary(transactionPayload []byte) map[string]any {
-	summary := map[string]any{"count": 0, "budget": recoveryPointBudgetHint}
 	status, _, err := deployd.Client{Socket: deployd.Defaults().Socket, Timeout: 10 * time.Second}.Call(context.Background(), "GET", "/v1/recovery-points", nil)
 	if err != nil {
-		return summary
+		return summarizeRecoveryPoints(0, nil)
 	}
 	var envelope struct {
 		Value struct {
-			Total    int `json:"total"`
-			Budget   int `json:"budget_units"`
-			Eligible int
-			Points   []struct {
+			Budget int `json:"budget_units"`
+			Points []struct {
 				Eligible bool `json:"eligible"`
 			} `json:"points"`
 		} `json:"value"`
 	}
 	if json.Unmarshal(status, &envelope) != nil {
-		return summary
+		return summarizeRecoveryPoints(0, nil)
 	}
-	summary["count"] = envelope.Value.Total
-	if envelope.Value.Budget > 0 {
-		summary["budget"] = envelope.Value.Budget
-	}
+	eligible := make([]bool, 0, len(envelope.Value.Points))
 	for _, point := range envelope.Value.Points {
-		if point.Eligible {
-			summary["eligible"] = summary["eligible"].(int) + 1
+		eligible = append(eligible, point.Eligible)
+	}
+	return summarizeRecoveryPoints(envelope.Value.Budget, eligible)
+}
+
+// summarizeRecoveryPoints keeps the update summary free of pointer games so a
+// deployment cannot fail after it already finalized.
+func summarizeRecoveryPoints(budget int, eligible []bool) map[string]any {
+	if budget <= 0 {
+		budget = recoveryPointBudgetHint
+	}
+	count := 0
+	for _, value := range eligible {
+		if value {
+			count++
 		}
 	}
-	if envelope.Value.Total >= envelope.Value.Budget {
+	summary := map[string]any{"count": len(eligible), "budget": budget, "eligible": count}
+	if len(eligible) >= budget {
 		summary["next_action"] = "agent-vm-deploy prune-recovery-points"
 	}
 	return summary
@@ -411,11 +419,11 @@ func runMaintenanceBinary(args []string) error {
 		if installed, err := install.DeployBinaryVersion(install.MaintenanceBinaryPath); err == nil && installed != version {
 			return fmt.Errorf("this binary is %s and the installed stable binary is %s; run the matching release binary", version, installed)
 		}
-		backup, err := install.InstallMaintenanceBinary(*product)
+		backups, err := install.InstallMaintenanceBinary(*product)
 		if err != nil {
 			return err
 		}
-		encoded, _ := json.Marshal(map[string]any{"maintenance_binary_version": release, "backup": backup})
+		encoded, _ := json.Marshal(map[string]any{"maintenance_binary_version": release, "backups": backups})
 		_, _ = os.Stdout.Write(append(encoded, '\n'))
 		return nil
 	}

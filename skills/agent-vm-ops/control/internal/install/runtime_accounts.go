@@ -21,6 +21,11 @@ import (
 // must be replaced and its service restarted by a separate host action.
 const MaintenanceBinaryPath = migrationDeployBinary
 
+// DeployBinaryPaths are the two operator entrypoints for the same binary. The
+// maintenance copy is what systemd runs; the bin copy is what operators call,
+// so both must carry the release that the kept backup and restart describe.
+var DeployBinaryPaths = []string{migrationDeployBinary, "/opt/agent-vm-native/bin/agent-vm-deploy"}
+
 var deploydVersionPattern = regexp.MustCompile(`agent-vm-deploy/[0-9][0-9A-Za-z.+-]*`)
 
 // ServedDeployBinaryVersion reports the version of the installed stable binary.
@@ -48,21 +53,26 @@ func DeployBinaryVersion(path string) (string, error) {
 // InstallMaintenanceBinary replaces the stable deployd executable with the
 // release copy, keeping one reversible backup under the same version-free name.
 // The caller owns restarting agent-vm-deployd.service.
-func InstallMaintenanceBinary(product string) (string, error) {
+func InstallMaintenanceBinary(product string) ([]string, error) {
 	source := filepath.Join(product, "bin", "agent-vm-deploy")
-	if err := copyInstall(source, MaintenanceBinaryPath+".new", 0755, ""); err != nil {
-		return "", err
+	var backups []string
+	for _, target := range DeployBinaryPaths {
+		staged := target + ".new"
+		if err := copyInstall(source, staged, 0755, ""); err != nil {
+			return backups, err
+		}
+		backup := target + ".previous"
+		if err := os.Rename(target, backup); err != nil && !errors.Is(err, os.ErrNotExist) {
+			_ = os.Remove(staged)
+			return backups, err
+		}
+		if err := os.Rename(staged, target); err != nil {
+			_ = os.Rename(backup, target)
+			return backups, err
+		}
+		backups = append(backups, backup)
 	}
-	backup := MaintenanceBinaryPath + ".previous"
-	if err := os.Rename(MaintenanceBinaryPath, backup); err != nil && !errors.Is(err, os.ErrNotExist) {
-		_ = os.Remove(MaintenanceBinaryPath + ".new")
-		return "", err
-	}
-	if err := os.Rename(MaintenanceBinaryPath+".new", MaintenanceBinaryPath); err != nil {
-		_ = os.Rename(backup, MaintenanceBinaryPath)
-		return "", err
-	}
-	return backup, nil
+	return backups, nil
 }
 
 const migrationDeployBinary = "/opt/agent-vm-native/maintenance/agent-vm-deploy"
