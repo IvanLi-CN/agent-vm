@@ -363,6 +363,34 @@ for slot in blue green; do
   assert_exec_start "$exec_start" "/var/lib/agent-vm-native/slots/$slot/bin/agent-vm-server serve --config /etc/agent-vm-native/slots/$slot/config.json --manifest /var/lib/agent-vm-native/slots/$slot/release-manifest.json" "$slot ExecStart" || fail "$slot ExecStart was not verified"
 done
 
+# Known issue: state markers are informational. A standby slot whose release does
+# not declare a marker present in the database must still start; before this fix
+# it exited with state_compatibility_mismatch and could not be revived.
+marker_manifest=/var/lib/agent-vm-native/slots/green/release-manifest.json
+cp -- "$marker_manifest" "$test_root/marker-manifest.original.json"
+python3 - "$marker_manifest" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    manifest = json.load(handle)
+compatibility = manifest.get("state_compatibility") or {"reads": [], "writes": []}
+markers = sorted(set(compatibility["reads"]) | {"future-marker@1"})
+manifest["state_compatibility"] = {"reads": markers, "writes": markers}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, sort_keys=True, indent=2)
+    handle.write("\n")
+PY
+systemctl restart agent-vm-native@green.service
+wait_active agent-vm-native@green.service || fail "standby slot with an undeclared state marker did not start"
+sleep 2
+systemctl is-active --quiet agent-vm-native@green.service || fail "standby slot with an undeclared state marker exited"
+cp -- "$test_root/marker-manifest.original.json" "$marker_manifest"
+systemctl restart agent-vm-native@green.service
+wait_active agent-vm-native@green.service || fail "standby slot did not restart with its original manifest"
+printf '%s\n' 'undeclared state markers no longer block slot startup'
+
 systemctl start agent-vm-deployd.service
 for _ in $(seq 1 100); do
   if ! systemctl is-active --quiet agent-vm-deployd.service; then
@@ -499,6 +527,7 @@ grep -Fq 'agent_vm_deployd_recovery_required 1' <<<"$recovery_metrics" || fail "
 status_json="$(/opt/agent-vm-native/bin/agent-vm-deploy status --json)"
 assert_status "$status_json" green blue
 
+
 if [[ -n "$recovery_fixture" ]]; then
   points="$(find /var/lib/agent-vm-native/migration/rqlite-recovery -mindepth 1 -maxdepth 1 -type d -name 'point-*' | wc -l)"
   [[ "$points" == 2 ]] || fail "recovery did not reuse the original rqlite recovery point"
@@ -509,4 +538,4 @@ fi
 systemctl stop agent-vm-deployd.service agent-vm-native@blue.service agent-vm-native@green.service
 AGENT_VM_ROLLBACK_CRASH_TEST=1 go -C "$control_root" test -count=1 ./internal/deployd -run '^TestRealSystemdRollbackCrashBudget$' -v
 
-printf '{"schema_version":1,"verdict":"pass","systemd":"real","slot_runtime":"testslot-adapter","real_control_binary":"version-smoke-passed","slots":"dual-process-and-uds","switch":"green","restart_recovery":"needs_recovery-and-bounded-rollback","metrics":"single-deployd-endpoint"}\n'
+printf '{"schema_version":1,"verdict":"pass","systemd":"real","slot_runtime":"testslot-adapter","real_control_binary":"version-smoke-passed","slots":"dual-process-and-uds","switch":"green","restart_recovery":"needs_recovery-and-bounded-rollback","state_markers":"informational","metrics":"single-deployd-endpoint"}\n'
