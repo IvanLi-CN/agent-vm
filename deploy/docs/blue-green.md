@@ -142,6 +142,24 @@ sudo "$deploy_cli" update --version '<semver>' --source-revision '<40-char-sourc
 
 需要指定文件时，在控制宿主的受保护目录放置正式完整包，并给同一命令添加 `--bundle /protected/path/release.tar`。若同时使用 `--server-file /protected/path/agent-vm-server`，该文件须与包内产物字节一致。两种输入都核对正式发布摘要、版本、源码和架构。使用[发布合同](../../docs/specs/agent-vm/contracts/release.md)中的恢复点门禁；收到 `backup_storage_exhausted` 时现役槽继续服务，不绕过门禁切换或回退。
 
+蓝绿事务只替换槽位产物，**不升级常驻的 deployd 自身**。更新成功后，命令会在 stderr 追加一行维护状态：`maintenance_binary` 为 `pending` 时，必须再执行下面两步，否则 deployd 仍以旧版本运行，新语义只生效一半。
+
+```sh
+# 1) 用本次 release 的二进制替换常驻 maintenance 二进制(先确认版本一致)
+sudo "$deploy_cli" maintenance-binary --install --product '<解包后的产品目录>'
+# 2) 重启 deployd，并确认它报告本次 release 版本
+sudo "$deploy_cli" maintenance-binary --restart
+```
+
+`--install` 会把旧二进制保留为 `<maintenance>.previous`，`--restart` 会核对新进程自报的版本，不一致时报错。两步之间没有事务，deployd 重启后必须重新执行 `status`、`doctor` 和 `admin status` 再宣称更新完成。
+
+恢复点预算为三个已验证恢复点，最新两个始终受保护。满额且无法按保留期回收时返回 `backup_storage_exhausted`，现役槽继续服务。不要手工移动目录，先查看预算并按需清理：
+
+```sh
+sudo "$deploy_cli" recovery-points            # 每个点的 created_at、blockers
+sudo "$deploy_cli" prune-recovery-points      # 只删可清理的最旧点
+```
+
 恢复或诊断时仍可直接查询原事务并执行受限阶段命令：
 
 ```sh

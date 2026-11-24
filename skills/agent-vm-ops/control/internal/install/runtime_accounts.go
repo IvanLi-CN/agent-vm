@@ -16,6 +16,55 @@ import (
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/manifest"
 )
 
+// MaintenanceBinaryPath is the stable deployd executable outside the slots. A
+// blue-green update replaces slot contents only, so the installed stable binary
+// must be replaced and its service restarted by a separate host action.
+const MaintenanceBinaryPath = migrationDeployBinary
+
+var deploydVersionPattern = regexp.MustCompile(`agent-vm-deploy/[0-9][0-9A-Za-z.+-]*`)
+
+// ServedDeployBinaryVersion reports the version of the installed stable binary.
+func ServedDeployBinaryVersion() (string, error) {
+	output, err := exec.Command(MaintenanceBinaryPath, "version").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// DeployBinaryVersion reads a binary's self-reported version without running it.
+func DeployBinaryVersion(path string) (string, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	match := deploydVersionPattern.Find(contents)
+	if match == nil {
+		return "", errors.New("binary does not report an agent-vm-deploy version")
+	}
+	return string(match), nil
+}
+
+// InstallMaintenanceBinary replaces the stable deployd executable with the
+// release copy, keeping one reversible backup under the same version-free name.
+// The caller owns restarting agent-vm-deployd.service.
+func InstallMaintenanceBinary(product string) (string, error) {
+	source := filepath.Join(product, "bin", "agent-vm-deploy")
+	if err := copyInstall(source, MaintenanceBinaryPath+".new", 0755, ""); err != nil {
+		return "", err
+	}
+	backup := MaintenanceBinaryPath + ".previous"
+	if err := os.Rename(MaintenanceBinaryPath, backup); err != nil && !errors.Is(err, os.ErrNotExist) {
+		_ = os.Remove(MaintenanceBinaryPath + ".new")
+		return "", err
+	}
+	if err := os.Rename(MaintenanceBinaryPath+".new", MaintenanceBinaryPath); err != nil {
+		_ = os.Rename(backup, MaintenanceBinaryPath)
+		return "", err
+	}
+	return backup, nil
+}
+
 const migrationDeployBinary = "/opt/agent-vm-native/maintenance/agent-vm-deploy"
 
 // prepareLegacyCandidateUnit is called with privately staged and validated

@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -221,5 +223,194 @@ func TestRecoverySnapshotVerifiesIntegrityAndCoverage(t *testing.T) {
 	}
 	if err := validateRegisteredRecoveryPoint(ctx, dir, point); err == nil {
 		t.Fatal("modified snapshot was accepted")
+	}
+}
+
+// seedRecoveryPoints writes one point per operation, oldest first, so budget
+// tests do not need the rqlite path of CreateRecoveryPoint.
+func seedRecoveryPoints(t *testing.T, runtime *HostRuntime, authority string, age time.Duration, operations ...string) {
+	t.Helper()
+	root := runtime.recoveryDirectory()
+	now := time.Now().UTC()
+	for index, operation := range operations {
+		id := "point-" + operation
+		dir := filepath.Join(root, id)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		point := recoveryPoint{ID: id, Operation: operation, Purpose: "stage", Authority: authority, SHA256: strings.Repeat("b", 64), Boundary: "epoch:" + id, Size: 1, Created: now.Add(-age + time.Duration(index)*time.Hour)}
+		if err := writeRecoveryRecord(dir, "point.json", point); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "snapshot.sqlite3"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func budgetRuntime(t *testing.T) (*HostRuntime, string) {
+	t.Helper()
+	config := Defaults()
+	config.Migration.RecoveryDirectory = filepath.Join(t.TempDir(), "recovery")
+	config.Migration.RQLiteURL = "https://rqlite.example:4001"
+	runtime := NewHostRuntime(config)
+	if err := runtime.ensureRecoveryDirectory(); err != nil {
+		t.Fatal(err)
+	}
+	root := runtime.recoveryDirectory()
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return runtime, runtime.RecoveryAuthority()
+}
+
+func TestRecoveryPointsReportAgeAndReferenceBlockers(t *testing.T) {
+	runtime, authority := budgetRuntime(t)
+	seedRecoveryPoints(t, runtime, authority, 40*24*time.Hour, "first", "second", "third")
+	status, err := runtime.RecoveryPoints()
+	if err != nil || len(status) != 3 {
+		t.Fatalf("points = %v, err = %v", status, err)
+	}
+	now := time.Now().UTC()
+	for index, point := range status {
+		report := recoveryPointReport{ID: point.ID, Created: point.Created}
+		report.Eligible = recoveryPointEligible(point, index, len(status), map[string]bool{}, now)
+		report.Blockers = recoveryPointBlockers(point, index, len(status), map[string]bool{}, now)
+		if report.Eligible != (index == 0) || (index > 0) != slices.Contains(report.Blockers, "newest") {
+			t.Fatalf("%s eligibility is wrong: eligible=%v blockers=%v", point.ID, report.Eligible, report.Blockers)
+		}
+	}
+	blocked := recoveryPointBlockers(status[0], 0, len(status), map[string]bool{recoveryPointKey("first", "stage"): true}, now)
+	if !slices.Contains(blocked, "referenced") {
+		t.Fatalf("a rollback-referenced point is not blocked: %v", blocked)
+	}
+}
+
+func TestPruneRecoveryPointsKeepsNewestTwo(t *testing.T) {
+	runtime, authority := budgetRuntime(t)
+	seedRecoveryPoints(t, runtime, authority, 40*24*time.Hour, "first", "second", "third")
+	pruned, err := runtime.PruneRecoveryPoints(time.Now().UTC(), map[string]bool{}, 2)
+	if err != nil || len(pruned) != 1 || pruned[0].ID != "point-first" {
+		t.Fatalf("pruned = %v, err = %v", pruned, err)
+	}
+	points, err := loadRecoveryPoints(runtime.recoveryDirectory())
+	if err != nil || len(points) != 2 || points[1].Operation != "third" {
+		t.Fatalf("points = %+v, err = %v", points, err)
+	}
+	if _, err := os.Stat(filepath.Join(runtime.recoveryDirectory(), "pruned-point-first.json")); err != nil {
+		t.Fatalf("prune left no deletion receipt: %v", err)
+	}
+	again, err := runtime.PruneRecoveryPoints(time.Now().UTC(), map[string]bool{}, 2)
+	if err != nil || len(again) != 0 {
+		t.Fatalf("second prune = %v, err = %v", again, err)
+	}
+}
+
+func TestPruneRecoveryPointsStopsAtReferenceAndRetention(t *testing.T) {
+	runtime, authority := budgetRuntime(t)
+	seedRecoveryPoints(t, runtime, authority, 40*24*time.Hour, "first", "second", "third")
+	pruned, err := runtime.PruneRecoveryPoints(time.Now().UTC(), map[string]bool{recoveryPointKey("first", "stage"): true}, 2)
+	if err != nil || len(pruned) != 0 {
+		t.Fatalf("referenced point was pruned: %v, err = %v", pruned, err)
+	}
+	young, err := runtime.PruneRecoveryPoints(time.Now().UTC().Add(-recoveryRetention+time.Hour), map[string]bool{}, 2)
+	if err != nil || len(young) != 0 {
+		t.Fatalf("retained point was pruned: %v, err = %v", young, err)
+	}
+}
+
+func TestRecoveryPointEndpoints(t *testing.T) {
+	runtime, authority := budgetRuntime(t)
+	seedRecoveryPoints(t, runtime, authority, 40*24*time.Hour, "first", "second", "third")
+	db, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	server := httptest.NewServer(NewServer(NewManager(db, runtime, time.Minute, time.Now), nil).Handler())
+	defer server.Close()
+	response, err := http.Get(server.URL + "/v1/recovery-points")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var listed struct {
+		Value struct {
+			Total  int `json:"total"`
+			Budget int `json:"budget_units"`
+			Points []struct {
+				Eligible bool `json:"eligible"`
+			} `json:"points"`
+		} `json:"value"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&listed); err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, decode = %v", response.StatusCode, err)
+	}
+	_ = response.Body.Close()
+	if len(listed.Value.Points) != 3 || listed.Value.Budget != 3 || !listed.Value.Points[0].Eligible || listed.Value.Points[1].Eligible {
+		t.Fatalf("listing = %+v", listed.Value)
+	}
+	pruned, err := http.Post(server.URL+"/v1/recovery-points/prune", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Value struct {
+			Pruned []struct {
+				ID string `json:"id"`
+			} `json:"pruned"`
+		} `json:"value"`
+	}
+	if err := json.NewDecoder(pruned.Body).Decode(&result); err != nil || len(result.Value.Pruned) != 1 || result.Value.Pruned[0].ID != "point-first" {
+		t.Fatalf("prune response = %+v, err = %v", result.Value, err)
+	}
+	_ = pruned.Body.Close()
+}
+
+func TestTransactionExposesRecordedCause(t *testing.T) {
+	runtime, _ := budgetRuntime(t)
+	db, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	manager := NewManager(db, runtime, time.Minute, time.Now)
+	transaction := store.Transaction{ID: "tx-cause", Phase: PhaseStage, State: "staged", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/b", Generation: 1}
+	if err := db.Create(t.Context(), transaction, nil); err != nil {
+		t.Fatal(err)
+	}
+	payload := map[string]any{"message": "deployment stage failed", "cause": "open <private-path> permission denied"}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(encoded)
+	if err := db.RecordFailure(t.Context(), transaction.ID, PhaseStage, "deployment_failed", "deployd", hex.EncodeToString(digest[:]), map[string]any{"message": "deployment stage failed", "cause": "open <private-path> permission denied"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	value, err := manager.Transaction(t.Context(), transaction.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure, ok := value["failure"].(map[string]any)
+	if !ok || failure["cause"] != "open <private-path> permission denied" {
+		t.Fatalf("transaction exposes no cause: %+v", value["failure"])
+	}
+	server := httptest.NewServer(NewServer(manager, nil).Handler())
+	defer server.Close()
+	response, err := http.Post(server.URL+"/v1/stage", "application/json", strings.NewReader(`{"target_slot":"green","bundle":"/b"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope struct {
+		Error struct {
+			Reason string `json:"reason"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if !strings.Contains(envelope.Error.Reason, "refusing") && envelope.Error.Reason == "" {
+		t.Fatalf("error response carries no reason: %+v", envelope.Error)
 	}
 }

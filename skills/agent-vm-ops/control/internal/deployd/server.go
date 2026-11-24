@@ -112,6 +112,8 @@ func (server *Server) Handler() http.Handler {
 	router.POST("/v1/recover", server.recover)
 	router.POST("/v1/migrate", server.migrate)
 	router.POST("/v1/bootstrap", server.bootstrap)
+	router.GET("/v1/recovery-points", server.recoveryPoints)
+	router.POST("/v1/recovery-points/prune", server.pruneRecoveryPoints)
 	router.NoRoute(func(c *gin.Context) {
 		writeError(c, http.StatusNotFound, "not_found", "deployd endpoint was not found")
 	})
@@ -197,7 +199,13 @@ func (server *Server) status(c *gin.Context) {
 	}
 	transactions := make([]map[string]any, 0, len(status.Transactions))
 	for index := range status.Transactions {
-		transactions = append(transactions, publicTransaction(status.Transactions[index]))
+		transaction := publicTransaction(status.Transactions[index])
+		// Listeners poll status instead of the journal; the active failure cause
+		// must be reachable without a second request.
+		if detail, err := server.Manager.failureEvidence(c.Request.Context(), transaction["transaction_id"].(string)); err == nil && detail != nil {
+			transaction["failure"] = detail
+		}
+		transactions = append(transactions, transaction)
 	}
 	writeOK(c, map[string]any{"observation": status.Observed, "transactions": transactions, "dedicated_service_account": isDeployAccount(os.Geteuid())})
 }
@@ -373,6 +381,24 @@ func (server *Server) migrate(c *gin.Context) {
 	writeOK(c, publicTransaction(*transaction))
 }
 
+func (server *Server) recoveryPoints(c *gin.Context) {
+	status, err := server.Manager.RecoveryPoints()
+	if err != nil {
+		writeError(c, http.StatusServiceUnavailable, "recovery_points_unavailable", err.Error())
+		return
+	}
+	writeOK(c, status)
+}
+
+func (server *Server) pruneRecoveryPoints(c *gin.Context) {
+	pruned, err := server.Manager.PruneRecoveryPoints()
+	if err != nil {
+		writeError(c, http.StatusConflict, "recovery_points_unavailable", err.Error())
+		return
+	}
+	writeOK(c, map[string]any{"pruned": pruned})
+}
+
 func decodeRequest(c *gin.Context, target any) bool {
 	reader := http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBytes)
 	defer c.Request.Body.Close()
@@ -408,6 +434,10 @@ func writeTransactionErrorForID(c *gin.Context, status int, code, requestID stri
 		code = "backup_storage_exhausted"
 	}
 	detail := map[string]any{"code": code, "message": publicErrorMessage(code, cause.Error()), "recovery_required": code == "state_unverified"}
+	if sanitized := sanitizedFailureCause(cause); sanitized != "" {
+		detail["reason"] = sanitized
+		detail["cause_type"] = fmt.Sprintf("%T", cause)
+	}
 	if requestID != "" {
 		detail["transaction_id"] = requestID
 		detail["phase"] = "unknown"
@@ -434,6 +464,10 @@ func writeTransactionErrorForID(c *gin.Context, status int, code, requestID stri
 
 func writeMigrationError(c *gin.Context, status int, code string, cause error) {
 	detail := map[string]any{"code": code, "message": publicErrorMessage(code, cause.Error())}
+	if sanitized := sanitizedFailureCause(cause); sanitized != "" {
+		detail["reason"] = sanitized
+		detail["cause_type"] = fmt.Sprintf("%T", cause)
+	}
 	var migrationErr *MigrationError
 	if errors.As(cause, &migrationErr) {
 		detail["transaction_id"] = migrationErr.TransactionID
