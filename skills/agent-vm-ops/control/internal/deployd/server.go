@@ -510,6 +510,12 @@ func publicTransaction(transaction store.Transaction) map[string]any {
 	if errorCode == "" {
 		errorCode = "none"
 	}
+	// A successful transaction has no failure message; mapping the empty code
+	// through publicErrorMessage would print a generic failure next to `none`.
+	errorMessage := ""
+	if transaction.ErrorCode != "" {
+		errorMessage = publicErrorMessage(transaction.ErrorCode, transaction.ErrorMessage)
+	}
 	return map[string]any{
 		"transaction_id":    transaction.ID,
 		"target_slot":       transaction.TargetSlot,
@@ -520,7 +526,7 @@ func publicTransaction(transaction store.Transaction) map[string]any {
 		"rollback_used":     transaction.RollbackUsed,
 		"recovery_required": transaction.RecoveryRequired,
 		"error_code":        errorCode,
-		"error_message":     publicErrorMessage(transaction.ErrorCode, transaction.ErrorMessage),
+		"error_message":     errorMessage,
 		"created_at":        transaction.CreatedAt,
 		"updated_at":        transaction.UpdatedAt,
 		"staging_id":        transactionStagingID(transaction.Bundle),

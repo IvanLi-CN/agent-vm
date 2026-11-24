@@ -295,7 +295,7 @@ func (manager *Manager) RecoveryPoints() (recoveryPointStatus, error) {
 		return recoveryPointStatus{}, err
 	}
 	now := manager.Clock().UTC()
-	status := recoveryPointStatus{BudgetUnits: recoveryPointBudget, RetentionDays: manager.retentionDays(), Points: make([]recoveryPointReport, 0, len(points))}
+	status := recoveryPointStatus{BudgetUnits: recoveryPointBudget, Total: len(points), RetentionDays: manager.retentionDays(), Points: make([]recoveryPointReport, 0, len(points))}
 	for index, point := range points {
 		status.Points = append(status.Points, recoveryPointReport{
 			ID: point.ID, Operation: point.Operation, Purpose: point.Purpose, Created: point.Created,
