@@ -1116,8 +1116,11 @@ func (manager *Manager) CompleteForward(ctx context.Context, id, bundle string) 
 // readiness cannot be observed. Structural authority (active link and systemd
 // slot identities) must still be fresh, and no slot may hold a role.
 func forwardRecoveryObservation(observation RuntimeSnapshot, transaction store.Transaction, now time.Time) error {
-	if observation.ObservedAt.IsZero() || observation.FreshUntil.IsZero() || !observation.FreshUntil.After(now) {
-		return errors.New("complete-forward requires a fresh observation")
+	// The composed freshness window collapses to the stale source, and a stopped
+	// active slot necessarily reports no slot health contract. Judge the sources
+	// this recovery depends on instead of the composed window.
+	if observation.ObservedAt.IsZero() || observation.ObservedAt.After(now.Add(2*time.Second)) {
+		return errors.New("complete-forward requires a current observation")
 	}
 	for _, name := range []string{"active_link", "systemd"} {
 		source, ok := observation.Sources[name]
