@@ -32,3 +32,17 @@ func TestServeDispatchAndLazyCLI(t *testing.T) {
 		t.Fatalf("CLI started daemon resources: %v", err)
 	}
 }
+
+func TestSummarizeRecoveryPointsCountsEligible(t *testing.T) {
+	summary := summarizeRecoveryPoints(3, []bool{true, false, false})
+	if summary["count"] != 3 || summary["eligible"] != 1 || summary["next_action"] != "agent-vm-deploy prune-recovery-points" {
+		t.Fatalf("summary = %+v", summary)
+	}
+	empty := summarizeRecoveryPoints(0, nil)
+	if empty["count"] != 0 || empty["budget"] != recoveryPointBudgetHint || empty["next_action"] != nil {
+		t.Fatalf("empty summary = %+v", empty)
+	}
+	if _, ok := empty["next_action"]; ok {
+		t.Fatal("empty summary advertises a prune action")
+	}
+}

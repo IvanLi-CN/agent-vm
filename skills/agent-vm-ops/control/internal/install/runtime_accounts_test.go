@@ -83,3 +83,44 @@ func TestDeployBinaryVersionReadsSelfReport(t *testing.T) {
 		t.Fatal("missing binary was accepted")
 	}
 }
+
+func TestInstallMaintenanceBinaryRefreshesEveryOperatorPath(t *testing.T) {
+	product := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(product, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(product, "bin", "agent-vm-deploy")
+	if err := os.WriteFile(source, []byte("agent-vm-deploy/9.9.9"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	targets := []string{filepath.Join(t.TempDir(), "maintenance", "agent-vm-deploy"), filepath.Join(t.TempDir(), "bin", "agent-vm-deploy")}
+	for _, target := range targets {
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte("agent-vm-deploy/1.0.0"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	previous := DeployBinaryPaths
+	DeployBinaryPaths = targets
+	defer func() { DeployBinaryPaths = previous }()
+	binary, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backups, err := installDeployBinary(product, func(_, destination string, _ os.FileMode, _ string) error {
+		return os.WriteFile(destination, binary, 0o755)
+	})
+	if err != nil || len(backups) != len(targets) {
+		t.Fatalf("backups = %v, err = %v", backups, err)
+	}
+	for index, target := range targets {
+		if installed, err := os.ReadFile(target); err != nil || string(installed) != "agent-vm-deploy/9.9.9" {
+			t.Fatalf("%s was not replaced: %v", target, err)
+		}
+		if kept, err := os.ReadFile(backups[index]); err != nil || string(kept) != "agent-vm-deploy/1.0.0" {
+			t.Fatalf("%s backup = %v", backups[index], err)
+		}
+	}
+}
