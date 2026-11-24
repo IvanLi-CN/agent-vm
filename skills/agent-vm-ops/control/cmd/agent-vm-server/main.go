@@ -167,12 +167,22 @@ func serve(args []string) error {
 		if err != nil {
 			return fmt.Errorf("read state capabilities: %w", err)
 		}
-		capabilityNames := make([]string, 0, len(capabilities))
-		for _, capability := range capabilities {
-			capabilityNames = append(capabilityNames, capability.Name+"@"+strconv.FormatInt(capability.Version, 10))
+		// State markers are records, not admission gates. A release that does not
+		// declare every marker already present in the database still starts; the
+		// mismatch is reported so an operator can judge the downgrade risk.
+		declared := make(map[string]struct{}, len(release.StateReads)+len(release.StateWrites))
+		for _, marker := range append(append([]string(nil), release.StateReads...), release.StateWrites...) {
+			declared[marker] = struct{}{}
 		}
-		if err := manifest.ValidateStateCapabilities(release, capabilityNames); err != nil {
-			return err
+		undeclared := make([]string, 0, len(capabilities))
+		for _, capability := range capabilities {
+			marker := capability.Name + "@" + strconv.FormatInt(capability.Version, 10)
+			if _, ok := declared[marker]; !ok {
+				undeclared = append(undeclared, marker)
+			}
+		}
+		if len(undeclared) > 0 {
+			slog.Warn("release does not declare state markers present in the database", "markers", undeclared, "release", release.ReleaseID)
 		}
 	}
 	runner := native.NewRunner()

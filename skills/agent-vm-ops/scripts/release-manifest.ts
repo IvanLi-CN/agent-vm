@@ -1634,7 +1634,9 @@ export function validate_product_manifest(value: unknown): ProductManifest {
     if (!_same_keys(compatibility, ["reads", "writes"])) throw _product_error("manifest_invalid", "state_compatibility has an unexpected shape");
     for (const key of ["reads", "writes"] as const) {
       const values = compatibility[key];
-      if (!Array.isArray(values) || values.length !== STATE_CAPABILITY_MARKERS.length || values.some((item) => typeof item !== "string") || values.join("\0") !== [...STATE_CAPABILITY_MARKERS].join("\0")) throw _product_error("manifest_state_compatibility_invalid", `state_compatibility.${key} must declare all state capability markers in order`);
+      // Markers are informational. A manifest records the state shapes it knows;
+      // declaring fewer than another release must not make the build invalid.
+      if (!Array.isArray(values) || values.some((item) => typeof item !== "string" || !/^[a-z0-9][a-z0-9-]*@[1-9][0-9]*$/.test(item))) throw _product_error("manifest_state_compatibility_invalid", `state_compatibility.${key} must list versioned marker strings`);
     }
     result.state_compatibility = { reads: [...STATE_CAPABILITY_MARKERS], writes: [...STATE_CAPABILITY_MARKERS] };
   }

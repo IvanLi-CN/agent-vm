@@ -634,9 +634,6 @@ func (runtime *HostRuntime) VerifySlotIdentity(_ context.Context, slot, releaseI
 	if metadata.ReleaseID != releaseID || metadata.SourceRevision != sourceRevision {
 		return fmt.Errorf("slot %s release identity does not match the verified rollback target", slot)
 	}
-	if err := releaseManifest.ValidateStateCapabilities(metadata, capabilities); err != nil {
-		return fmt.Errorf("verify slot %s state compatibility: %w", slot, err)
-	}
 	return nil
 }
 

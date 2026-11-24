@@ -86,7 +86,7 @@ func (manager *Manager) finishBootstrap(ctx context.Context, tx store.Transactio
 	}
 	target := snapshot.Slots["blue"]
 	other := snapshot.Slots["green"]
-	if !target.ProcessUp || !target.ProcessReady || target.ControllerOwned || target.TrafficAccepting || target.ReleaseID == "" || target.SourceRevision == "" || target.StateEpoch == "" || target.StateAuthority == "" || len(target.StateCapabilities) == 0 || other.ProcessUp || other.ControllerOwned || other.TrafficAccepting {
+	if !target.ProcessUp || !target.ProcessReady || target.ControllerOwned || target.TrafficAccepting || target.ReleaseID == "" || target.SourceRevision == "" || target.StateEpoch == "" || target.StateAuthority == "" || other.ProcessUp || other.ControllerOwned || other.TrafficAccepting {
 		return fail(PhaseBootstrap, errors.New("initial standby identity and isolation were not verified"))
 	}
 	if err := manager.transitionAfterEffect(ctx, id, PhaseBootstrap, PhaseControllerHandoff, "verified", map[string]any{"release_id": target.ReleaseID, "source_revision": target.SourceRevision, "state_epoch": target.StateEpoch, "state_authority": target.StateAuthority, "state_capabilities": target.StateCapabilities}); err != nil {
@@ -119,7 +119,7 @@ func (manager *Manager) finishBootstrap(ctx context.Context, tx store.Transactio
 	}
 	snapshot, err = manager.observe(ctx, id)
 	current := snapshot.Slots["blue"]
-	if err != nil || !validObservation(snapshot, manager.Clock().UTC()) || snapshot.ActiveSlot != "blue" || !current.Ready || !current.ControllerOwned || !current.TrafficAccepting || current.ReleaseID != target.ReleaseID || current.SourceRevision != target.SourceRevision || current.StateEpoch == "" || current.StateAuthority != target.StateAuthority || !sameStateCapabilities(current.StateCapabilities, target.StateCapabilities) {
+	if err != nil || !validObservation(snapshot, manager.Clock().UTC()) || snapshot.ActiveSlot != "blue" || !current.Ready || !current.ControllerOwned || !current.TrafficAccepting || current.ReleaseID != target.ReleaseID || current.SourceRevision != target.SourceRevision || current.StateEpoch == "" || current.StateAuthority != target.StateAuthority {
 		return fail(PhaseActiveSwitch, errors.New("initial active controller was not verified"))
 	}
 	if err := stopRenewal(); err != nil {

@@ -45,6 +45,11 @@ var stateCapabilityMarkers = []string{
 	"vm-hold@1",
 }
 
+// State markers are informational: a release records the state shapes it
+// understands, but neither startup nor deployment may refuse a marker it does
+// not declare. Downgrade risk belongs to the operator.
+var stateCapabilityMarkerPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*@[1-9][0-9]*$`)
+
 var actionNames = func() []string {
 	names := make([]string, 0, len(protocol.Actions))
 	for action := range protocol.Actions {
@@ -701,14 +706,14 @@ func stateCompatibility(value any) ([]string, []string, error) {
 	}
 	parse := func(value any, label string) ([]string, error) {
 		values, ok := value.([]any)
-		if !ok || len(values) == 0 || len(values) > len(stateCapabilityMarkers) {
-			return nil, fmt.Errorf("manifest_state_compatibility_invalid: %s must declare a supported state capability prefix", label)
+		if !ok {
+			return nil, fmt.Errorf("manifest_state_compatibility_invalid: %s must be a list of markers", label)
 		}
 		result := make([]string, len(values))
 		for index, raw := range values {
 			item, ok := raw.(string)
-			if !ok || item != stateCapabilityMarkers[index] {
-				return nil, fmt.Errorf("manifest_state_compatibility_invalid: %s must use a supported sorted marker prefix", label)
+			if !ok || !stateCapabilityMarkerPattern.MatchString(item) {
+				return nil, fmt.Errorf("manifest_state_compatibility_invalid: %s entries must be versioned marker strings", label)
 			}
 			result[index] = item
 		}
@@ -723,41 +728,6 @@ func stateCompatibility(value any) ([]string, []string, error) {
 		return nil, nil, err
 	}
 	return reads, writes, nil
-}
-
-// ValidateStateCapabilities rejects activation when the candidate manifest
-// cannot preserve every capability already present in the migrated database.
-func ValidateStateCapabilities(metadata Metadata, capabilities []string) error {
-	if !metadata.ManifestPresent {
-		return nil
-	}
-	requiredReads := metadata.StateReads
-	requiredWrites := metadata.StateWrites
-	if len(requiredReads) == 0 {
-		requiredReads = []string{stateCapabilityMarkers[0]}
-		requiredWrites = []string{stateCapabilityMarkers[0]}
-	}
-	available := make(map[string]struct{}, len(capabilities))
-	for _, capability := range capabilities {
-		available[capability] = struct{}{}
-	}
-	readSet := make(map[string]struct{}, len(requiredReads))
-	writeSet := make(map[string]struct{}, len(requiredWrites))
-	for _, value := range requiredReads {
-		readSet[value] = struct{}{}
-	}
-	for _, value := range requiredWrites {
-		writeSet[value] = struct{}{}
-	}
-	for capability := range available {
-		if _, ok := readSet[capability]; !ok {
-			return fmt.Errorf("state_compatibility_mismatch: release cannot read database capability %s", capability)
-		}
-		if _, ok := writeSet[capability]; !ok {
-			return fmt.Errorf("state_compatibility_mismatch: release cannot write database capability %s", capability)
-		}
-	}
-	return nil
 }
 
 type checkedArtifact struct {

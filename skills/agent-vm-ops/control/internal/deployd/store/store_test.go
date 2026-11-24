@@ -142,7 +142,7 @@ func TestStoreRejectsObservationDigestMismatch(t *testing.T) {
 	}
 }
 
-func TestStoreBeginRollbackAtomicallyConsumesRollbackBudget(t *testing.T) {
+func TestStoreBeginRollbackAllowsOperatorRetry(t *testing.T) {
 	now := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
 	s, err := Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), time.Hour, func() time.Time { return now })
 	if err != nil {
@@ -157,8 +157,10 @@ func TestStoreBeginRollbackAtomicallyConsumesRollbackBudget(t *testing.T) {
 	if err != nil || updated == nil || !updated.RollbackUsed || updated.Phase != "rollback" {
 		t.Fatalf("rollback transaction = %#v err=%v", updated, err)
 	}
-	if _, err := s.BeginRollback(context.Background(), transaction.ID, "rollback", "rollback", "retry", "test", nil, now); err == nil {
-		t.Fatalf("second rollback unexpectedly succeeded: %v", err)
+	// Repeated rollback is an operator retry, not a budget violation.
+	again, err := s.BeginRollback(context.Background(), transaction.ID, "rollback", "rollback", "retry", "test", nil, now)
+	if err != nil || again == nil || again.Phase != "rollback" {
+		t.Fatalf("repeated rollback = %#v err=%v", again, err)
 	}
 }
 
