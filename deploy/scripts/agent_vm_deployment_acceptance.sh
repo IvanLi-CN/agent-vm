@@ -252,11 +252,11 @@ for _ in $(seq 1 120); do
     cat "$proof_dir/rqlite.log" >&2
     fail "rqlited exited before becoming ready"
   fi
-  if curl --fail --silent --show-error --cacert "$ca_dir/ca.crt" \
-    --user "agent-vm-backup:$backup_secret" "$rqlite_base/status" >/dev/null 2>&1; then
-    rqlite_ready=1
-    break
-  fi
+  status_body="$(curl --fail --silent --show-error --cacert "$ca_dir/ca.crt" \
+    --user "agent-vm-backup:$backup_secret" "$rqlite_base/status" 2>/dev/null || true)"
+  case "$status_body" in
+    *'"ready":true'*) rqlite_ready=1; break ;;
+  esac
   sleep 0.25
 done
 (( rqlite_ready == 1 )) || { cat "$proof_dir/rqlite.log" >&2; fail "rqlite did not become ready"; }
