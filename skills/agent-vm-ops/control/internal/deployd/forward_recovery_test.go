@@ -191,8 +191,10 @@ func forwardSnapshot(now time.Time) RuntimeSnapshot {
 		"systemd":        {Up: true, ObservedAt: now, FreshUntil: now.Add(30 * time.Second)},
 		"slot_contracts": {Up: false, ObservedAt: now, FreshUntil: now.Add(30 * time.Second), Error: "one or more slot health contracts could not be observed"},
 	}
+	// A stopped active slot leaves the composed window and the slot health
+	// contract stale, exactly like the live host this recovery targets.
 	return RuntimeSnapshot{
-		ObservedAt: now, FreshUntil: now.Add(30 * time.Second),
+		ObservedAt: now, FreshUntil: now,
 		ActiveSlot: "green", ControllerSlot: "none", Consistent: false,
 		Slots:   map[string]SlotObservation{"blue": {Slot: "blue", ObservedUnix: now.Unix()}, "green": {Slot: "green", ObservedUnix: now.Unix()}},
 		Sources: sources,
@@ -220,8 +222,10 @@ func TestForwardRecoveryObservationAcceptsStoppedActiveSlot(t *testing.T) {
 		t.Fatal("controller role was accepted")
 	}
 	stale := forwardSnapshot(now)
-	stale.FreshUntil = now.Add(-time.Second)
+	staleSource := stale.Sources["systemd"]
+	staleSource.FreshUntil = now.Add(-time.Second)
+	stale.Sources["systemd"] = staleSource
 	if err := forwardRecoveryObservation(stale, transaction, now); err == nil {
-		t.Fatal("stale observation was accepted")
+		t.Fatal("stale systemd evidence was accepted")
 	}
 }
