@@ -126,7 +126,7 @@ func TestRecoveryBackupRejectsIncompleteStreams(t *testing.T) {
 	}
 }
 
-func TestRecoveryPointRetentionAndPendingReconciliation(t *testing.T) {
+func TestRecoveryPointBudgetReliefAndPendingReconciliation(t *testing.T) {
 	now := time.Now().UTC()
 	for _, test := range []struct {
 		name  string
@@ -135,10 +135,12 @@ func TestRecoveryPointRetentionAndPendingReconciliation(t *testing.T) {
 		holds map[string]bool
 		prune bool
 	}{
-		{name: "young", age: recoveryRetention - time.Second},
-		{name: "leased", age: recoveryRetention, lease: now.Add(time.Hour)},
-		{name: "protected transaction", age: recoveryRetention, holds: map[string]bool{"old": true}},
-		{name: "eligible at threshold", age: recoveryRetention, prune: true},
+		// Age never blocks budget relief: a point outside the newest two, its
+		// lease and the referenced set carries no recovery role.
+		{name: "young", age: time.Minute, prune: true},
+		{name: "leased", age: 40 * 24 * time.Hour, lease: now.Add(time.Hour)},
+		{name: "protected transaction", age: 40 * 24 * time.Hour, holds: map[string]bool{recoveryPointKey("old", "stage"): true}},
+		{name: "eligible", age: 40 * 24 * time.Hour, prune: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			config := Defaults()
@@ -152,7 +154,7 @@ func TestRecoveryPointRetentionAndPendingReconciliation(t *testing.T) {
 				if err := os.MkdirAll(dir, 0o700); err != nil {
 					t.Fatal(err)
 				}
-				point := recoveryPoint{ID: id, Operation: operation, Authority: authority, SHA256: strings.Repeat("b", 64), Boundary: "epoch:" + id, Size: 1, Created: now.Add(-test.age + time.Duration(i)*time.Hour)}
+				point := recoveryPoint{ID: id, Operation: operation, Purpose: "stage", Authority: authority, SHA256: strings.Repeat("b", 64), Boundary: "epoch:" + id, Size: 1, Created: now.Add(-test.age + time.Duration(i)*time.Hour)}
 				if i == 0 {
 					point.LeaseUntil = test.lease
 				}
@@ -306,16 +308,31 @@ func TestPruneRecoveryPointsKeepsNewestTwo(t *testing.T) {
 	}
 }
 
-func TestPruneRecoveryPointsStopsAtReferenceAndRetention(t *testing.T) {
+func TestPruneRecoveryPointsStopsAtReferenceAndLease(t *testing.T) {
 	runtime, authority := budgetRuntime(t)
 	seedRecoveryPoints(t, runtime, authority, 40*24*time.Hour, "first", "second", "third")
 	pruned, err := runtime.PruneRecoveryPoints(time.Now().UTC(), map[string]bool{recoveryPointKey("first", "stage"): true}, 2)
 	if err != nil || len(pruned) != 0 {
 		t.Fatalf("referenced point was pruned: %v, err = %v", pruned, err)
 	}
-	young, err := runtime.PruneRecoveryPoints(time.Now().UTC().Add(-recoveryRetention+time.Hour), map[string]bool{}, 2)
-	if err != nil || len(young) != 0 {
-		t.Fatalf("retained point was pruned: %v, err = %v", young, err)
+	leasedRuntime, leasedAuthority := budgetRuntime(t)
+	seedRecoveryPoints(t, leasedRuntime, leasedAuthority, 40*24*time.Hour, "first", "second", "third")
+	root := leasedRuntime.recoveryDirectory()
+	data, err := os.ReadFile(filepath.Join(root, "point-first", "point.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var leased recoveryPoint
+	if err := json.Unmarshal(data, &leased); err != nil {
+		t.Fatal(err)
+	}
+	leased.LeaseUntil = time.Now().UTC().Add(time.Hour)
+	if err := writeRecoveryRecord(filepath.Join(root, "point-first"), "point.json", leased); err != nil {
+		t.Fatal(err)
+	}
+	held, err := leasedRuntime.PruneRecoveryPoints(time.Now().UTC(), map[string]bool{}, 2)
+	if err != nil || len(held) != 0 {
+		t.Fatalf("leased point was pruned: %v, err = %v", held, err)
 	}
 }
 

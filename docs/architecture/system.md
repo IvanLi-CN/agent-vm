@@ -224,7 +224,7 @@ rqlite 在迁移后仍是唯一状态权威。
 只有证据证明状态后端启用后没有 durable write、`state_epoch` advance、lease change 或 native effect，才可在独立的管理员授权恢复流程中重新导入迁移前 SQLite snapshot；
 禁止并行打开 stale SQLite、猜测重建或删表恢复。
 状态恢复材料不会因蓝绿激活成功而删除。
-保留策略最多保存三个已验证恢复点，超过三十天的恢复点进入清理候选，同一控制环境内全部恢复材料的总硬上限为 1 GiB，并始终保留最后两个恢复点。
+保留策略最多保存三个已验证恢复点，未被最新两个、租约、回退目标或未完成事务保护的恢复点进入清理候选，同一控制环境内全部恢复材料的总硬上限为 1 GiB，并始终保留最后两个恢复点。
 1 GiB 按实际文件大小计算，不是预分配空间，也不存在体积下限。
 迁移源 SQLite snapshot 在迁移完成并通过新的 rqlite restore check 后保留七天。
 预算不足时停止创建新的恢复点并报告 `backup_storage_exhausted`，不得删除最后两个恢复点或让备份继续无界增长。预算占满前可显式运行 `agent-vm-deploy recovery-points` 查看阻塞项，再用 `prune-recovery-points` 回收已到期且无人引用的最旧点。

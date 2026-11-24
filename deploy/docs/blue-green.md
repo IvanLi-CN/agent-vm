@@ -151,9 +151,9 @@ sudo "$deploy_cli" maintenance-binary --install --product '<解包后的产品�
 sudo "$deploy_cli" maintenance-binary --restart
 ```
 
-`--install` 会把旧二进制保留为 `<maintenance>.previous`，`--restart` 会核对新进程自报的版本，不一致时报错。两步之间没有事务，deployd 重启后必须重新执行 `status`、`doctor` 和 `admin status` 再宣称更新完成。
+`--install` 会把旧二进制保留为 `<maintenance>.previous`；`--restart` 以磁盘上安装的二进制为准，重启后轮询 `/v1/status` 确认服务真的可用，未就绪时报错。两步之间没有事务，deployd 重启后必须重新执行 `status`、`doctor` 和 `admin status` 再宣称更新完成。
 
-恢复点预算为三个已验证恢复点，最新两个始终受保护。满额且无法按保留期回收时返回 `backup_storage_exhausted`，现役槽继续服务。不要手工移动目录，先查看预算并按需清理：
+恢复点预算为三个已验证恢复点，最新两个、有效租约、回退目标和未完成事务始终受保护；最旧的点不在这些保护范围内即可回收，年龄不影响判定。满额且全部受保护时返回 `backup_storage_exhausted`，现役槽继续服务。不要手工移动目录，先查看预算并按需清理：
 
 ```sh
 sudo "$deploy_cli" recovery-points            # 每个点的 created_at、blockers
