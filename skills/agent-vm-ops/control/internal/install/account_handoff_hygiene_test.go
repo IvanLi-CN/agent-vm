@@ -20,3 +20,16 @@ func TestFreshAccountRulesRecreateDeploydRuntime(t *testing.T) {
 		t.Fatalf("fresh account rules lost the deployd singleton lock:\n%s", source)
 	}
 }
+
+// A dedicated deployd must be able to stage a verified release bundle after the
+// handoff. Without release-staging in ReadWritePaths every later update fails at
+// /v1/stage even though the slot roles look healthy.
+func TestDedicatedDeploydCanStageReleaseBundles(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("../../../../..", "deploy/assets/systemd/fresh-deploy-account.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(source), "/var/lib/agent-vm-native/release-staging") {
+		t.Fatalf("dedicated deployd cannot write the release staging root:\n%s", source)
+	}
+}
