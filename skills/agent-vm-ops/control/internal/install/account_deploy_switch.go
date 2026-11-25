@@ -25,7 +25,7 @@ const deploymentUnit = "agent-vm-deployd.service"
 // handoffDeploymentUnit keeps the incumbent unit definition in place up to
 // the point the journal transfer succeeds. The passed materials are from the
 // verified, private installation snapshot.
-func handoffDeploymentUnit(ctx context.Context, handoff deployd.AccountHandoff, input Inputs) error {
+func handoffDeploymentUnit(ctx context.Context, handoff deployd.AccountHandoff, input Inputs) (result error) {
 	materials := input.Materials
 	account, err := os.ReadFile(filepath.Join(materials, "assets/systemd/fresh-deploy-account.conf"))
 	if err != nil {
@@ -44,7 +44,28 @@ func handoffDeploymentUnit(ctx context.Context, handoff deployd.AccountHandoff, 
 	const directory = "/etc/systemd/system/" + deploymentUnit + ".d"
 	active := filepath.Join(directory, "20-service-account.conf")
 	temporary := filepath.Join(directory, "21-account-handoff.conf")
-	if err := switchDeploymentAccount(ctx, handoff, func(ctx context.Context) error {
+	published := false
+	defer func() {
+		// The startup-only instruction must never outlive the attempt. A
+		// --adopt-account-handoff that survives into the steady unit makes every
+		// later restart crash once the witness lease expires, so it is cleared on
+		// every outcome, including a failed ownership confirmation.
+		clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if !published {
+			return
+		}
+		if err := removeAccountHandoffDropIn(temporary, adopt); err != nil {
+			result = errors.Join(result, fmt.Errorf("startup-only unit configuration was not cleared: %w", err))
+		} else if err := command(clearCtx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
+			result = errors.Join(result, fmt.Errorf("startup-only unit configuration reload failed: %w", err))
+		}
+		// The evidence is single-use: the next handoff must publish its own.
+		if err := removeAccountHandoffEvidence(); err != nil {
+			result = errors.Join(result, err)
+		}
+	}()
+	result = switchDeploymentAccount(ctx, handoff, func(ctx context.Context) error {
 		if err := transferDeploymentPaths(ctx, materials, handoff.Lease.Slot); err != nil {
 			return err
 		}
@@ -53,6 +74,7 @@ func handoffDeploymentUnit(ctx context.Context, handoff deployd.AccountHandoff, 
 		if err := installFile(temporary, adopt, 0644, ""); err != nil {
 			return err
 		}
+		published = true
 		if err := installFile(active, steady, 0644, ""); err != nil {
 			return err
 		}
@@ -60,16 +82,33 @@ func handoffDeploymentUnit(ctx context.Context, handoff deployd.AccountHandoff, 
 			return err
 		}
 		return command(ctx, "/usr/bin/systemctl", "start", deploymentUnit)
-	}); err != nil {
+	})
+	return result
+}
+
+// removeAccountHandoffEvidence consumes the live handoff evidence this attempt
+// published. Leaving it behind makes a later handoff refuse to publish its own
+// evidence, so a failed attempt would block every retry.
+func removeAccountHandoffEvidence() error {
+	info, err := os.Lstat(deployd.AccountHandoffFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
-	if err := removeAccountHandoffDropIn(temporary, adopt); err != nil {
-		return fmt.Errorf("controller adopted; cannot clear startup-only unit configuration: %w", err)
+	_, gid, err := dedicatedDeploymentIDs()
+	if err != nil {
+		return err
 	}
-	if err := command(ctx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
-		return fmt.Errorf("controller adopted; systemd configuration reload failed: %w", err)
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != 0 || int(stat.Gid) != gid || !info.Mode().IsRegular() || info.Mode().Perm() != 0640 {
+		return errors.New("account handoff evidence is not a protected root-owned file")
 	}
-	return nil
+	if err := os.Remove(deployd.AccountHandoffFile); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(deployd.AccountHandoffFile))
 }
 
 func transferDeploymentPaths(ctx context.Context, materials, active string) error {
@@ -121,12 +160,20 @@ func prepareHandoffAccount(ctx context.Context, input Inputs) error {
 	if err := grantCandidateConfigRead(targets["deployd_config"].path, expected, gid); err != nil {
 		return fmt.Errorf("grant deployment configuration access: %w", err)
 	}
-	for _, rule := range []struct{ file, prefix string }{
-		{"agent-vm-native.conf", "/etc/agent-vm-native/backup"},
-		{"agent-vm-native.conf", "/var/lib/agent-vm-native/routing"},
-		{"agent-vm-fresh-accounts.conf", filepath.Dir(deployd.DedicatedDatabase)},
+	// The dedicated accounts need their runtime directories recreated at every
+	// boot, including the deployd singleton lock inside /run. Keep the rule
+	// file installed so systemd-tmpfiles applies it after a host restart.
+	freshAccounts := filepath.Join("/etc/tmpfiles.d", "agent-vm-fresh-accounts.conf")
+	if err := copyInstall(filepath.Join(assets, "tmpfiles.d/agent-vm-fresh-accounts.conf"), freshAccounts, 0644, ""); err != nil {
+		return err
+	}
+	for _, rule := range []struct{ file, source, prefix string }{
+		{"agent-vm-native.conf", filepath.Join(assets, "tmpfiles.d/agent-vm-native.conf"), "/etc/agent-vm-native/backup"},
+		{"agent-vm-native.conf", filepath.Join(assets, "tmpfiles.d/agent-vm-native.conf"), "/var/lib/agent-vm-native/routing"},
+		{"agent-vm-fresh-accounts.conf", freshAccounts, filepath.Dir(deployd.DedicatedDatabase)},
+		{"agent-vm-fresh-accounts.conf", freshAccounts, "/run/agent-vm-native"},
 	} {
-		if err := command(ctx, "/usr/bin/systemd-tmpfiles", "--create", "--prefix="+rule.prefix, filepath.Join(assets, "tmpfiles.d", rule.file)); err != nil {
+		if err := command(ctx, "/usr/bin/systemd-tmpfiles", "--create", "--prefix="+rule.prefix, rule.source); err != nil {
 			return err
 		}
 	}
