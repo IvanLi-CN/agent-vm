@@ -131,7 +131,7 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		observation := SlotObservation{Slot: slot, ObservedUnix: now.Unix()}
 		body, status, requestErr := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/health", nil)
 		if requestErr != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) {
-			if requestErr != nil && runtime.systemdSlotStopped(ctx, slot) {
+			if requestErr != nil && runtime.systemdSlotNotRunning(ctx, slot) {
 				runtime.mu.Lock()
 				evidence := runtime.quiesced[slot]
 				runtime.mu.Unlock()
@@ -142,6 +142,10 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 					slotContractsUp = false
 					snapshot.Consistent = false
 				}
+				// A slot that systemd reports stopped is observed, not a failed
+				// lane. Recovery needs a fresh systemd lane exactly when the
+				// candidate never started; requiring recorded quiescence here
+				// froze that lane and blocked complete-forward.
 				observation.MetricFamilies = runtime.slotMetrics(slot)
 				snapshot.Slots[slot] = observation
 				continue
@@ -1946,6 +1950,27 @@ func (runtime *HostRuntime) systemdSlotStopped(ctx context.Context, slot string)
 		return false
 	}
 	return systemdSlotStoppedProperties(parseSystemdProperties(string(output)))
+}
+
+// systemdSlotNotRunning reports that the unit has no process. Observation uses
+// it so a crashed candidate still yields a fresh lane; stop proofs keep the
+// stricter clean-stop predicate.
+func (runtime *HostRuntime) systemdSlotNotRunning(ctx context.Context, slot string) bool {
+	if validSlot(slot) != nil {
+		return false
+	}
+	unit := "agent-vm-native@" + slot + ".service"
+	output, err := exec.CommandContext(ctx, "systemctl", "show", unit,
+		"--property=LoadState", "--property=ActiveState", "--property=MainPID", "--property=FragmentPath").Output()
+	if err != nil {
+		return false
+	}
+	properties := parseSystemdProperties(string(output))
+	if properties["LoadState"] != "loaded" || properties["MainPID"] != "0" ||
+		filepath.Clean(properties["FragmentPath"]) != "/etc/systemd/system/agent-vm-native@.service" {
+		return false
+	}
+	return properties["ActiveState"] == "inactive" || properties["ActiveState"] == "failed"
 }
 
 func (runtime *HostRuntime) verifyFailedRollbackSlotStopped(ctx context.Context, slot string) bool {
