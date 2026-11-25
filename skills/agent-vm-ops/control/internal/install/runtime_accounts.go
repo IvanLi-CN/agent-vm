@@ -124,7 +124,11 @@ func prepareLegacyCandidateUnit(ctx context.Context, activeSlot string, input In
 	if err := PrepareLegacySlotAccess(activeSlot); err != nil {
 		return fmt.Errorf("prepare incumbent slot access for account migration: %w", err)
 	}
-	if err := copyInstall(filepath.Join(product, "bin", "agent-vm-deploy"), migrationDeployBinary, 0755, ""); err != nil {
+	// The maintenance binary is replaced, not merely created: an older install
+	// already owns this path and its bytes cannot match the candidate release.
+	// Reuse the atomic staged-rename contract so the previous binary survives as
+	// .previous for recovery.
+	if _, err := installDeployBinary(product, copyInstall); err != nil {
 		return err
 	}
 	// The legacy installation creates these root-owned directories with mode
