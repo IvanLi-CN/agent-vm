@@ -33,3 +33,17 @@ func TestDedicatedDeploydCanStageReleaseBundles(t *testing.T) {
 		t.Fatalf("dedicated deployd cannot write the release staging root:\n%s", source)
 	}
 }
+
+// A legacy install may already run the helper sockets with older definitions.
+// systemd drops their listening descriptor when the unit file changes, so the
+// handoff must restart them instead of issuing a no-op start.
+func TestHandoffRestartsHelperSockets(t *testing.T) {
+	source, err := os.ReadFile("runtime_accounts.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	if !strings.Contains(text, `"restart", "agent-vm-deploy-host.socket", "agent-vm-slot-relay.socket"`) {
+		t.Fatal("the handoff starts the helper sockets without restarting them")
+	}
+}

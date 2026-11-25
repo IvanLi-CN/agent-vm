@@ -266,6 +266,9 @@ func (server *Server) stage(c *gin.Context) {
 			writeTransactionError(c, http.StatusConflict, "deployment_compatibility_blocked", err)
 			return
 		}
+		// A rejected stage leaves no durable transaction behind, so the server
+		// log is the only place an operator can learn why it was refused.
+		slog.Warn("deployment stage rejected", "target_slot", value.TargetSlot, "error", sanitizedFailureCause(err))
 		writeTransactionError(c, http.StatusConflict, "stage_rejected", err)
 		return
 	}

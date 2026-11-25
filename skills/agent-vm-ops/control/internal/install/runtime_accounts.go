@@ -519,7 +519,15 @@ func prepareHandoffSockets(ctx context.Context, materials string) error {
 	}
 	// The API socket still belongs to the old daemon. It is pulled in by
 	// the new service's Requires= only after the old process has stopped.
-	return command(ctx, "/usr/bin/systemctl", "start", "agent-vm-deploy-host.socket", "agent-vm-slot-relay.socket")
+	//
+	// restart, not start: a legacy install may already run these sockets with
+	// the old definitions, and systemd drops the listening file descriptor once
+	// a socket unit's configuration changed under it. `start` is a no-op there
+	// and leaves a unit that reports active while every connect is refused.
+	if err := command(ctx, "/usr/bin/systemctl", "enable", "agent-vm-deploy-host.socket", "agent-vm-slot-relay.socket"); err != nil {
+		return err
+	}
+	return command(ctx, "/usr/bin/systemctl", "restart", "agent-vm-deploy-host.socket", "agent-vm-slot-relay.socket")
 }
 
 func prepareFreshAccounts(ctx context.Context, materials string) error {
