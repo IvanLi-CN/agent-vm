@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
@@ -140,6 +143,9 @@ func prepareLegacyCandidateUnit(ctx context.Context, activeSlot string, input In
 	if err := prepareDeploydForCandidate(ctx); err != nil {
 		return err
 	}
+	if err := prepareRecoveryCredentials(); err != nil {
+		return err
+	}
 	if err := prepareMigrationObserver(ctx, materials); err != nil {
 		return err
 	}
@@ -152,6 +158,66 @@ func prepareLegacyCandidateUnit(ctx context.Context, activeSlot string, input In
 		return err
 	}
 	return command(ctx, "/usr/bin/systemctl", "daemon-reload")
+}
+
+// prepareRecoveryCredentials supplies the backup-only rqlite identity that
+// recovery points need. Deployd releases before the recovery feature never
+// created these files, and stage refuses without them.
+func prepareRecoveryCredentials() error {
+	const (
+		authDir  = "/etc/agent-vm-native/backup"
+		authPath = authDir + "/auth.json"
+		caPath   = authDir + "/ca.crt"
+	)
+	installedAuth, err := protectedRead("/etc/agent-vm-native/rqlite/auth.json")
+	if err != nil {
+		return err
+	}
+	credential, err := deployd.ExportBackupCredential(installedAuth)
+	if err != nil {
+		return err
+	}
+	certificate, err := protectedRead("/etc/agent-vm-native/tls/rqlite/server.crt")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(authDir, 0750); err != nil {
+		return err
+	}
+	if err := os.Chown(authDir, 0, gidOf("agent-vm-deploy")); err != nil {
+		return err
+	}
+	for path, data := range map[string][]byte{authPath: credential, caPath: certificate} {
+		if existing, readErr := os.ReadFile(path); readErr == nil && bytes.Equal(existing, data) {
+			continue
+		}
+		if err := replaceOwnedFileOrCreate(path, data, 0640); err != nil {
+			return err
+		}
+		if err := os.Chown(path, 0, gidOf("agent-vm-deploy")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func gidOf(group string) int {
+	found, err := user.LookupGroup(group)
+	if err != nil {
+		return 0
+	}
+	value, err := strconv.Atoi(found.Gid)
+	if err != nil {
+		return 0
+	}
+	return value
+}
+
+func replaceOwnedFileOrCreate(path string, data []byte, mode os.FileMode) error {
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return installFile(path, data, mode, "")
+	}
+	return replaceOwnedFile(path, data, mode)
 }
 
 // prepareDeploydForCandidate moves the incumbent root deployd onto the verified
@@ -175,7 +241,7 @@ func prepareDeploydForCandidate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := installFile(path, next, 0644, ""); err != nil {
+	if err := replaceOwnedFile(path, next, 0644); err != nil {
 		return err
 	}
 	if err := command(ctx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
@@ -217,6 +283,38 @@ func migratedDeploydUnit(current []byte) ([]byte, error) {
 		value = strings.Replace(value, "[Service]\n", "[Service]\nReadWritePaths=/var/lib/agent-vm-native /run/agent-vm-native /etc/systemd/system/agent-vm-native@blue.service.d /etc/systemd/system/agent-vm-native@green.service.d\n", 1)
 	}
 	return []byte(value), nil
+}
+
+// replaceOwnedFile updates a root-owned unit in place. Unlike installFile it
+// accepts changed bytes, because the candidate unit is a legitimate rewrite.
+func replaceOwnedFile(path string, data []byte, mode os.FileMode) error {
+	info, err := os.Lstat(path)
+	owner, owned := info.Sys().(*syscall.Stat_t)
+	if err != nil || !owned || owner.Uid != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("refusing to replace %s", path)
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), ".unit-")
+	if err != nil {
+		return err
+	}
+	name := temp.Name()
+	defer os.Remove(name)
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Chmod(mode); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
 }
 
 func waitDeploydStatus(ctx context.Context) error {
@@ -365,7 +463,10 @@ func prepareMigrationObserver(ctx context.Context, materials string) error {
 	if err := command(ctx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
 		return err
 	}
-	return command(ctx, "/usr/bin/systemctl", "start", socket)
+	// Legacy installations ship the observer socket disabled; recovery and the
+	// controller lease maintenance both need it after the migration restarts
+	// deployd.
+	return command(ctx, "/usr/bin/systemctl", "enable", "--now", socket)
 }
 
 func migrationObserverUnit(service []byte) ([]byte, error) {
