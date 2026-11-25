@@ -159,3 +159,18 @@ func TestFreshSlotAccountGrantsRqliteCertificateRead(t *testing.T) {
 		t.Fatalf("slot account drop-in cannot read the rqlite certificate:\n%s", source)
 	}
 }
+
+func TestMigratedDeploydUnitAddsMissingReadWritePaths(t *testing.T) {
+	original := []byte("[Service]\nExecStart=/opt/agent-vm-native/bin/agent-vm-deploy serve --config /etc/agent-vm-native/deployd.json\n")
+	migrated, err := migratedDeploydUnit(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(migrated)
+	if strings.Count(text, "ReadWritePaths=") != 1 {
+		t.Fatalf("expected exactly one ReadWritePaths line:\n%s", text)
+	}
+	if !strings.Contains(text, "/etc/systemd/system/agent-vm-native@green.service.d") {
+		t.Fatalf("drop-in path missing:\n%s", text)
+	}
+}
