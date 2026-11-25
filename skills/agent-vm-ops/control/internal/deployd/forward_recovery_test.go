@@ -229,3 +229,25 @@ func TestForwardRecoveryObservationAcceptsStoppedActiveSlot(t *testing.T) {
 		t.Fatal("stale systemd evidence was accepted")
 	}
 }
+
+func TestCompleteForwardAcceptsTrafficEnablePhase(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	transaction := fencedForwardTransaction(t, database)
+	if _, err := database.Transition(ctx, transaction.ID, PhaseRollback, PhaseTrafficEnable, "needs_recovery", "candidate_traffic_unobserved", "deployd", nil, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	runtime := fencedForwardRuntime()
+	manager := NewManager(database, runtime, time.Minute, time.Now)
+	finished, err := manager.CompleteForward(ctx, transaction.ID, "/verified/blue-1.12.0.tar")
+	if err != nil {
+		t.Fatalf("complete-forward at traffic_enable: %v", err)
+	}
+	if finished.Phase != PhaseFinalize || finished.State != "finalized" {
+		t.Fatalf("forward recovery transaction = %#v", finished)
+	}
+}
