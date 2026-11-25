@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -122,5 +123,39 @@ func TestInstallMaintenanceBinaryRefreshesEveryOperatorPath(t *testing.T) {
 		if kept, err := os.ReadFile(backups[index]); err != nil || string(kept) != "agent-vm-deploy/1.0.0" {
 			t.Fatalf("%s backup = %v", backups[index], err)
 		}
+	}
+}
+
+func TestMigratedDeploydUnitWidensDropInsOnce(t *testing.T) {
+	original := []byte("[Service]\nExecStart=/opt/agent-vm-native/bin/agent-vm-deploy serve --config /etc/agent-vm-native/deployd.json\nReadWritePaths=/var/lib/agent-vm-native /run/agent-vm-native\n")
+	migrated, err := migratedDeploydUnit(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(migrated)
+	if !strings.Contains(text, "ExecStart="+migrationDeployBinary+" serve") {
+		t.Fatalf("executable was not moved to the maintenance copy:\n%s", text)
+	}
+	for _, dir := range []string{"/etc/systemd/system/agent-vm-native@blue.service.d", "/etc/systemd/system/agent-vm-native@green.service.d"} {
+		if !strings.Contains(text, dir) {
+			t.Fatalf("%s missing from ReadWritePaths:\n%s", dir, text)
+		}
+	}
+	again, err := migratedDeploydUnit(migrated)
+	if err != nil || string(again) != text {
+		t.Fatalf("migration is not idempotent: %v\n%s", err, again)
+	}
+	if _, err := migratedDeploydUnit([]byte("[Service]\nRestart=on-failure\n")); err == nil {
+		t.Fatal("unit without a deploy executable was accepted")
+	}
+}
+
+func TestFreshSlotAccountGrantsRqliteCertificateRead(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("../../../../..", "deploy/assets/systemd/fresh-slot-account.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(source), "SupplementaryGroups=agent-vm-server agent-vm-rqlite") {
+		t.Fatalf("slot account drop-in cannot read the rqlite certificate:\n%s", source)
 	}
 }

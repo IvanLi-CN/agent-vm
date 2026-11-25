@@ -996,7 +996,7 @@ func (manager *Manager) CompleteForward(ctx context.Context, id, bundle string) 
 		return nil, errors.New("complete-forward requires a transaction in needs_recovery")
 	}
 	switch transaction.Phase {
-	case PhaseStage, PhaseStandbyValidation, PhaseControllerHandoff, PhaseRollback:
+	case PhaseStage, PhaseStandbyValidation, PhaseControllerHandoff, PhaseTrafficEnable, PhaseRollback:
 	default:
 		return nil, fmt.Errorf("complete-forward is not allowed in phase %s", transaction.Phase)
 	}

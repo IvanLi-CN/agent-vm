@@ -272,7 +272,7 @@ func applyHostAction(ctx context.Context, action hostAction) error {
 		}
 		contents := "[Unit]\nConditionPathExists=\nConditionPathExists=" + binary +
 			"\nConditionPathExists=" + cfg + "\n[Service]\nUser=" + slotUser +
-			"\nSupplementaryGroups=agent-vm-server\nEnvironment=INCUS_CONF=/etc/agent-vm-native/incus" +
+			"\nSupplementaryGroups=agent-vm-server agent-vm-rqlite\nEnvironment=INCUS_CONF=/etc/agent-vm-native/incus" +
 			"\nEnvironment=SSL_CERT_FILE=" + ServerAuthorityCA +
 			"\nEnvironment=AGENT_VM_LEGACY_SLOT=" + action.Slot +
 			"\nEnvironment=PATH=/opt/agent-vm-native/compat-incus:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" +

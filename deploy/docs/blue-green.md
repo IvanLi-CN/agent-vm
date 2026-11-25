@@ -110,6 +110,8 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 
 ## 普通蓝绿切换
 
+账户迁移在 stage 之前会把常驻 deployd 换成已验证的候选二进制，并把两个槽位 drop-in 目录加入它的 `ReadWritePaths`：旧 unit（例如 1.6.0）只有 `ProtectSystem=full` 而没有这两条路径，候选槽 drop-in 会以 `read-only file system` 失败。候选槽以 `agent-vm-server` 运行时还必须能读 rqlite 证书，槽位 drop-in 因此把 `agent-vm-rqlite` 加进 `SupplementaryGroups`；缺少它时槽位会报 `sqlite_unavailable` 且永远不会进入 traffic 角色。
+
 账户迁移会在准备候选槽时先启用 root 专用 SSH 请求入口 `/run/agent-vm-native/control.sock`。该入口按活跃槽的真实 UID 转发，所以迁移前的 root 槽、新账户槽和回退后的历史槽使用同一 protocol 4。固定请求适配器及历史包无需改写。若 SSH 连接资料曾显式使用 `/var/lib/agent-vm-native/active/app.sock`，须在新入口已就绪、现役槽仍在服务时将 `remote_socket` 改为 `/run/agent-vm-native/control.sock`，并用普通 `status` 请求核验；只看 `doctor` 或部署健康检查不能证明业务请求权限正确。保留原连接资料用于维护恢复，不放宽槽位对 root 或部署账户的业务授权。
 
 转发入口不更改 operation ID、generation 或请求正文；读取或传输失败时不重发。客户端继续按原 operation ID 查询不确定的变更结果。回退验证必须包含 root SSH 普通业务请求，而非仅以服务账户直接访问槽位。

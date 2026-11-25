@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
@@ -136,6 +137,9 @@ func prepareLegacyCandidateUnit(ctx context.Context, activeSlot string, input In
 	if err := prepareRequestEntry(ctx, materials, true); err != nil {
 		return err
 	}
+	if err := prepareDeploydForCandidate(ctx); err != nil {
+		return err
+	}
 	if err := prepareMigrationObserver(ctx, materials); err != nil {
 		return err
 	}
@@ -148,6 +152,87 @@ func prepareLegacyCandidateUnit(ctx context.Context, activeSlot string, input In
 		return err
 	}
 	return command(ctx, "/usr/bin/systemctl", "daemon-reload")
+}
+
+// prepareDeploydForCandidate moves the incumbent root deployd onto the verified
+// candidate executable before staging. Legacy units run an older deployd that
+// cannot write the candidate slot drop-ins (ProtectSystem=full without the
+// drop-in directories in ReadWritePaths), so the unit is widened and the
+// candidate binary replaces the maintenance copy first.
+func prepareDeploydForCandidate(ctx context.Context) error {
+	for _, slot := range []string{"blue", "green"} {
+		dir := filepath.Join("/etc/systemd/system", "agent-vm-native@"+slot+".service.d")
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			return err
+		}
+	}
+	path := "/etc/systemd/system/agent-vm-deployd.service"
+	current, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	next, err := migratedDeploydUnit(current)
+	if err != nil {
+		return err
+	}
+	if err := installFile(path, next, 0644, ""); err != nil {
+		return err
+	}
+	if err := command(ctx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
+		return err
+	}
+	if err := command(ctx, "/usr/bin/systemctl", "restart", "agent-vm-deployd.service"); err != nil {
+		return err
+	}
+	return waitDeploydStatus(ctx)
+}
+
+// migratedDeploydUnit points the stable service at the verified maintenance copy
+// and lets it write the candidate drop-ins. It is idempotent for retries.
+func migratedDeploydUnit(current []byte) ([]byte, error) {
+	value := string(current)
+	started := false
+	lines := strings.Split(value, "\n")
+	for index, line := range lines {
+		if strings.HasPrefix(line, "ExecStart=/opt/agent-vm-native/") {
+			lines[index] = "ExecStart=" + migrationDeployBinary + " serve --config /etc/agent-vm-native/deployd.json"
+			started = true
+		}
+		if strings.HasPrefix(line, "ReadWritePaths=") {
+			for _, dir := range []string{
+				"/etc/systemd/system/agent-vm-native@blue.service.d",
+				"/etc/systemd/system/agent-vm-native@green.service.d",
+			} {
+				if !strings.Contains(line, dir) {
+					lines[index] += " " + dir
+				}
+			}
+		}
+	}
+	if !started {
+		return nil, errors.New("deployd unit does not start a verified deploy executable")
+	}
+	value = strings.Join(lines, "\n")
+	if !strings.Contains(value, "ReadWritePaths=") {
+		value = strings.Replace(value, "[Service]\n", "[Service]\nReadWritePaths=/var/lib/agent-vm-native /run/agent-vm-native /etc/systemd/system/agent-vm-native@blue.service.d /etc/systemd/system/agent-vm-native@green.service.d\n", 1)
+	}
+	return []byte(value), nil
+}
+
+func waitDeploydStatus(ctx context.Context) error {
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		probe, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_, _, err := deployd.Client{Socket: deployd.Defaults().Socket, Timeout: 5 * time.Second}.Call(probe, "GET", "/v1/status", nil)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("candidate deployd did not answer after restart")
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 func slotAccountDropIns(materials string) (account, migration []byte, err error) {
