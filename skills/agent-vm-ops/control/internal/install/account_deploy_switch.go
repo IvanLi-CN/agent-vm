@@ -52,15 +52,16 @@ func handoffDeploymentUnit(ctx context.Context, handoff deployd.AccountHandoff, 
 		// every outcome, including a failed ownership confirmation.
 		clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		if !published {
-			return
+		if published {
+			if err := removeAccountHandoffDropIn(temporary, adopt); err != nil {
+				result = errors.Join(result, fmt.Errorf("startup-only unit configuration was not cleared: %w", err))
+			} else if err := command(clearCtx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
+				result = errors.Join(result, fmt.Errorf("startup-only unit configuration reload failed: %w", err))
+			}
 		}
-		if err := removeAccountHandoffDropIn(temporary, adopt); err != nil {
-			result = errors.Join(result, fmt.Errorf("startup-only unit configuration was not cleared: %w", err))
-		} else if err := command(clearCtx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
-			result = errors.Join(result, fmt.Errorf("startup-only unit configuration reload failed: %w", err))
-		}
-		// The evidence is single-use: the next handoff must publish its own.
+		// The evidence is single-use and is published inside the switch, before
+		// the incumbent stops. It must be consumed on every outcome: a leftover
+		// file would make the next attempt refuse to publish its own evidence.
 		if err := removeAccountHandoffEvidence(); err != nil {
 			result = errors.Join(result, err)
 		}
@@ -171,12 +172,15 @@ func prepareHandoffAccount(ctx context.Context, input Inputs) error {
 		{"agent-vm-native.conf", filepath.Join(assets, "tmpfiles.d/agent-vm-native.conf"), "/etc/agent-vm-native/backup"},
 		{"agent-vm-native.conf", filepath.Join(assets, "tmpfiles.d/agent-vm-native.conf"), "/var/lib/agent-vm-native/routing"},
 		{"agent-vm-fresh-accounts.conf", freshAccounts, filepath.Dir(deployd.DedicatedDatabase)},
-		{"agent-vm-fresh-accounts.conf", freshAccounts, "/run/agent-vm-native"},
 	} {
 		if err := command(ctx, "/usr/bin/systemd-tmpfiles", "--create", "--prefix="+rule.prefix, rule.source); err != nil {
 			return err
 		}
 	}
+	// Do not apply the /run prefix here. Its deployd.lock rule hands the file to
+	// agent-vm-deploy, while the journal copy that follows requires the incumbent
+	// root-owned lock inode. The installed rule file takes effect at the next
+	// boot, which is exactly when the dedicated account needs it.
 	return installBackupInputs(cfg)
 }
 
