@@ -82,7 +82,13 @@ func handoffDeploymentUnit(ctx context.Context, handoff deployd.AccountHandoff, 
 		if err := command(ctx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
 			return err
 		}
-		return command(ctx, "/usr/bin/systemctl", "start", deploymentUnit)
+		// The dedicated deployd inherits its listening socket from systemd, so it
+		// must be socket-activated. Starting the service unit alone hands it no
+		// activation descriptor and serve exits with an unprivileged-listener error.
+		if err := command(ctx, "/usr/bin/systemctl", "start", deploymentUnit+".socket"); err != nil {
+			return err
+		}
+		return nil
 	})
 	return result
 }
