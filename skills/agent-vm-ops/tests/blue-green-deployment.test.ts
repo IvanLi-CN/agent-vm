@@ -114,8 +114,12 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(deployd).not.toContain("RuntimeDirectory=agent-vm-native");
   expect(deployd).not.toContain("Wants=agent-vm-native@blue.service agent-vm-native@green.service");
   expect(deployd).toContain("After=agent-vm-native@blue.service agent-vm-native@green.service");
-  expect(slot).toContain("ExecStartPre=/opt/agent-vm-native/bin/agent-vm-deploy wait-authority --slot %i --timeout 55");
-  expect(slot).toContain("ExecStartPost=/opt/agent-vm-native/bin/agent-vm-deploy wait-process --slot %i --timeout 55");
+  // The adapter lives in bin/ before account migration and in maintenance/
+  // after; the unit resolves it, so assert the command rather than the path.
+  expect(slot).toContain("wait-authority --slot %i --timeout 55");
+  expect(slot).toContain("wait-process --slot %i --timeout 55");
+  expect(slot).toContain("/opt/agent-vm-native/maintenance/agent-vm-deploy");
+  expect(slot).toContain("/opt/agent-vm-native/bin/agent-vm-deploy");
   const deploydConfig = json("deploy/assets/deployd.json.example");
   expect(deploydConfig.migration.legacy_unit).toBe("agent-vm-native.service");
   expect(deploydConfig.migration.rqlite_unit).toBe("agent-vm-rqlite.service");
