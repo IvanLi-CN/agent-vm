@@ -299,10 +299,16 @@ func runUpdate(args []string) error {
 	// still names the previous maintenance binary keeps starting that binary;
 	// the same applies to the request adapter's privilege flags. Publishing is
 	// idempotent and happens before the effect barrier.
-	product, err := os.MkdirTemp(directory, ".units-")
+	// Expose verified bundle hands the staging directory to the deployment
+	// account, so it can no longer host a root-owned extraction. Use a private
+	// temporary tree instead.
+	productRoot, err := os.MkdirTemp("", "agent-vm-units-")
 	if err == nil {
+		// Extract creates its destination itself and therefore requires an
+		// absent path; hand it a fresh child rather than the temp root.
+		product := filepath.Join(productRoot, "product")
 		published, publishErr := publishHostUnits(bundle, product)
-		_ = os.RemoveAll(product)
+		_ = os.RemoveAll(productRoot)
 		if publishErr != nil {
 			return publishErr
 		}
