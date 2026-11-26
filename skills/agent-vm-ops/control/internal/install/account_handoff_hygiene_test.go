@@ -61,3 +61,21 @@ func TestHandoffRestartsDeploydSocket(t *testing.T) {
 		t.Fatal("the handoff starts the deployd socket without restarting it")
 	}
 }
+
+// The request relay derives the slot UID and setuids into it. NO_NEW_PRIVS
+// forbids that transition, so the adapter service must not enable it or every
+// SSH-request operation fails with "fork/exec /proc/self/fd/3: operation not
+// permitted" once the slot runs under its own account.
+func TestRequestRelayMayDropToTheSlotAccount(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("../../../../..", "deploy/assets/systemd/agent-vm-request@.service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	if strings.Contains(text, "NoNewPrivileges=yes") {
+		t.Fatal("the request relay cannot setuid into the slot account under NO_NEW_PRIVS")
+	}
+	if !strings.Contains(text, "NoNewPrivileges=no") {
+		t.Fatal("the request relay should state its setuid requirement explicitly")
+	}
+}

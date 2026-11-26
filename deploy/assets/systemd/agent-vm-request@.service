@@ -7,7 +7,12 @@ User=root
 ExecStart=/opt/agent-vm-native/bin/agent-vm-deploy request-relay
 StandardInput=socket
 StandardOutput=journal
-NoNewPrivileges=yes
+# The relay derives the slot UID it must run as and setuids into it. NO_NEW_PRIVS
+# forbids that transition, so the adapter could never reach an unprivileged slot:
+# every request failed with "fork/exec /proc/self/fd/3: operation not permitted".
+# Dropping the flag keeps the process root-privileged and lets it drop to the
+# slot account, which is the only identity allowed to call the slot socket.
+NoNewPrivileges=no
 ProtectHome=yes
 PrivateTmp=yes
 ProtectSystem=strict
