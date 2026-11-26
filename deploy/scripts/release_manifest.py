@@ -169,7 +169,7 @@ GO_UNIT_EXEC_START = {
     "agent-vm-deployd.service":
         "ExecStart=/opt/agent-vm-native/bin/agent-vm-deploy serve --config /etc/agent-vm-native/deployd.json",
 }
-GO_UNIT_CONTENT_SHA256 = {'agent-vm-native@.service': 'e5f4466bdc697aabb51b1bd4927c2dd2db76ad243d837f6c770e835823ee1ad0', 'agent-vm-native.service': 'e7478fbca22fab14cab7f4888a3eba1f49250f6953911a1d3e8ac5ef8c5e58f1', 'agent-vm-deployd.service': '4dc20420f19703a659011bf5ed4a4309791d189e8ab2a3ef955ff3f3b41d2770'}
+GO_UNIT_CONTENT_SHA256 = {'agent-vm-native@.service': 'cc9ecc0f20c8736feb45da00a8fdf7f46122df398623d3e339217d635e8bdb76', 'agent-vm-native.service': 'e7478fbca22fab14cab7f4888a3eba1f49250f6953911a1d3e8ac5ef8c5e58f1', 'agent-vm-deployd.service': '4dc20420f19703a659011bf5ed4a4309791d189e8ab2a3ef955ff3f3b41d2770'}
 
 PRODUCT_UNIT_EXEC_START = {
     "agent-vm-native.service": GO_UNIT_EXEC_START["agent-vm-native.service"],
@@ -187,6 +187,7 @@ HISTORICAL_PRODUCT_UNIT_EXEC_START = {
 }
 HISTORICAL_GO_UNIT_CONTENT_SHA256 = {
     "agent-vm-native@.service": (
+        "e5f4466bdc697aabb51b1bd4927c2dd2db76ad243d837f6c770e835823ee1ad0",
         "2f8b3f360bd43aaf13c7dd30aa2c618aa1f4522b5e179ec3b04a604bddf8455a",
         "ca12ae977aca62872921c03ea70795a2864859b8b9c963d2a9024321068fa057",
         "a014ff37ba6e96d5e7ef0cf2aa6c99b6bb66ebd61bad327afeb510cde02ab887",
