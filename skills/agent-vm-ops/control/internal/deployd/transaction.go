@@ -1292,7 +1292,9 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	ctx = context.WithValue(ctx, controllerMaintenanceKey{}, policy)
 	observation, err := manager.observe(ctx, "")
 	if err != nil {
-		return manager.fenceSlots(ctx, errors.New("slot observation could not be persisted; controller roles were fenced"))
+		// Keep the underlying cause: without it every renewal failure reads as
+		// the same wrapper and no operator can tell which source broke.
+		return manager.fenceSlots(ctx, fmt.Errorf("slot observation could not be persisted; controller roles were fenced: %w", err))
 	}
 	transactions, err := manager.Store.ListActive(ctx)
 	if err != nil {
