@@ -57,7 +57,7 @@ func TestHandoffRestartsDeploydSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(source), `"restart", deploymentUnit+".socket"`) {
+	if !strings.Contains(string(source), `"restart", deploydSocketUnit`) {
 		t.Fatal("the handoff starts the deployd socket without restarting it")
 	}
 }
