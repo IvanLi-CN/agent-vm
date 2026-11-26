@@ -8,9 +8,13 @@ ConditionPathExists=/etc/agent-vm-native/slots/%i/config.json
 
 [Service]
 Type=simple
-ExecStartPre=/opt/agent-vm-native/bin/agent-vm-deploy wait-authority --slot %i --timeout 55
+# The deploy adapter lives in bin/ on a fresh install and in maintenance/
+# after host account migration; older releases resolved it differently.
+# The shared `/usr/bin/sh -c` wrapper picks whichever exists so one unit
+# definition serves both forms.
+ExecStartPre=/usr/bin/sh -c 'adapter=$(command -v /opt/agent-vm-native/maintenance/agent-vm-deploy || echo /opt/agent-vm-native/bin/agent-vm-deploy); exec "$adapter" wait-authority --slot %i --timeout 55'
 ExecStart=/var/lib/agent-vm-native/slots/%i/bin/agent-vm-server serve --config /etc/agent-vm-native/slots/%i/config.json --manifest /var/lib/agent-vm-native/slots/%i/release-manifest.json
-ExecStartPost=/opt/agent-vm-native/bin/agent-vm-deploy wait-process --slot %i --timeout 55
+ExecStartPost=/usr/bin/sh -c 'adapter=$(command -v /opt/agent-vm-native/maintenance/agent-vm-deploy || echo /opt/agent-vm-native/bin/agent-vm-deploy); exec "$adapter" wait-process --slot %i --timeout 55'
 Environment=HOME=/var/lib/agent-vm-native
 Environment=SSL_CERT_FILE=/etc/agent-vm-native/tls/rqlite/server.crt
 CPUWeight=100

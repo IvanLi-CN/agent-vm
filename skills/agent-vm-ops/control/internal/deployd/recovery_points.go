@@ -156,7 +156,7 @@ func (runtime *HostRuntime) CreateRecoveryPoint(ctx context.Context, operation, 
 			return err
 		}
 	}
-	used, err := recoveryMaterialBytes(runtime.Config.Migration.RecoveryDirectory)
+	used, err := scopedRecoveryMaterialBytes(runtime.Config.Migration.RecoveryDirectory)
 	if err != nil {
 		return err
 	}
@@ -454,7 +454,7 @@ func scopedRecoveryPoints(points []recoveryPoint, authority string) []storedReco
 // removeRecoveryPoint persists the deletion target before its bytes, so an
 // interruption finishes only the deletion that was already approved.
 func removeRecoveryPoint(directory, root string, point recoveryPoint) error {
-	used, err := recoveryMaterialBytes(directory)
+	used, err := scopedRecoveryMaterialBytes(directory)
 	if err != nil {
 		return err
 	}
@@ -627,11 +627,26 @@ func writeRecoveryRecord(directory, name string, point recoveryPoint) error {
 
 // Both one-time SQLite migration snapshots and rqlite recovery material
 // consume the same byte budget, including files still being written.
-func recoveryMaterialBytes(directory string) (int64, error) {
+// scopedRecoveryMaterialBytes measures only the material this deployment
+// plane owns: rqlite recovery points, their pruning receipts and migration
+// snapshots. Historical backups parked in the same directory (previous
+// binaries, quarantined stages, input copies) are not restored by any
+// transaction, so charging them against the budget starves deployments on
+// hosts that accumulated them.
+func scopedRecoveryMaterialBytes(directory string) (int64, error) {
 	var total int64
 	err := filepath.WalkDir(directory, func(path string, entry os.DirEntry, err error) error {
-		if err != nil || entry.IsDir() {
+		if err != nil {
 			return err
+		}
+		if entry.IsDir() {
+			if path != directory && !inRecoveryScope(directory, path) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !inRecoveryScope(directory, path) {
+			return nil
 		}
 		info, err := entry.Info()
 		if err != nil {
@@ -647,6 +662,23 @@ func recoveryMaterialBytes(directory string) (int64, error) {
 		return nil
 	})
 	return total, err
+}
+
+// inRecoveryScope reports whether path is rqlite recovery material or a
+// migration snapshot.
+func inRecoveryScope(directory, path string) bool {
+	relative, err := filepath.Rel(directory, path)
+	if err != nil {
+		return false
+	}
+	if relative == "." {
+		return true
+	}
+	if head := strings.SplitN(relative, string(filepath.Separator), 2)[0]; head == "rqlite-recovery" {
+		return true
+	}
+	base := filepath.Base(relative)
+	return strings.HasPrefix(base, "migration-") && strings.HasSuffix(base, ".sqlite3")
 }
 
 func (runtime *HostRuntime) recoveryClient() (*http.Client, string, string, error) {

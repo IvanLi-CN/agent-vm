@@ -287,7 +287,7 @@ Deployd 随后验证初始 standby 的 release、状态能力和进程身份，�
 
 首次安装事务在慢速组合观测期间，通过独立的角色通道核验已授予 controller 的进程身份和完整 lease 身份，并只延长仍有效的同一 lease。进程变化、lease 到期、身份不匹配或通道失败均终止续期并进入原事务恢复，不能分配新 term 来掩盖丢失。事务结束或请求取消会停止该续期。UDS 保留 30 秒请求读取预算，响应写入上限为 9000 秒，以覆盖既有迁移事务的最长等待；metrics 监听的短超时不变。
 
-槽位 unit 的 `ExecStartPre` 通过 `agent-vm-deploy wait-authority` 使用该槽位受保护配置中的 HTTPS rqlite 身份，等待状态接口和 `SELECT 1` strong read 均成功；只读检查不打开业务 SQLite、不修改 schema，也不授予角色。rqlite 的 systemd 进程已启动不足以证明内部 store 已打开或 leader 已就绪。前置检查和进程启动共享 unit 的 60 秒总启动预算，不能因检查而无限等待。
+槽位 unit 的 `ExecStartPre` 通过 `agent-vm-deploy wait-authority` 使用该槽位受保护配置中的 HTTPS rqlite 身份，等待状态接口和 `SELECT 1` strong read 均成功；只读检查不打开业务 SQLite、不修改 schema，也不授予角色。部署适配器在全新安装中位于 `bin/`，完成账户迁移后位于 `maintenance/`；槽位单例 unit 通过两个位置的解析包装调用它，使同一 unit 定义在迁移前后都成立。`update` 在产生效果前把发布包内的 unit 资产（含槽位单例、helper 与 request 单元）刷新到宿主，并重启被改写的 socket 单元：槽位 drop-in 不覆盖 `ExecStartPre`/`ExecStartPost`，`update` 之外的路径不会刷新它们，残留的旧定义会让槽位持续调用过期二进制。unit 资产刷新幂等，不携带运维数据。rqlite 的 systemd 进程已启动不足以证明内部 store 已打开或 leader 已就绪。前置检查和进程启动共享 unit 的 60 秒总启动预算，不能因检查而无限等待。
 
 槽位启动后的进程身份等待预算为 60 秒，与槽位 systemd unit 的启动预算一致；期间仍须验证实际 PID、进程启动标识及 health 合同，超时进入失败或恢复，不能仅凭 systemd 已启动判定成功。
 

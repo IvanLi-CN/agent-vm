@@ -553,7 +553,7 @@ func (runtime *HostRuntime) checkMigrationBudget(sourceSize int64) error {
 	if err != nil {
 		return fmt.Errorf("inspect migration recovery budget: %w", err)
 	}
-	total, err := recoveryMaterialBytes(runtime.Config.Migration.RecoveryDirectory)
+	total, err := scopedRecoveryMaterialBytes(runtime.Config.Migration.RecoveryDirectory)
 	if err != nil {
 		return err
 	}

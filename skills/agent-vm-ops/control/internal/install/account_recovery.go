@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -27,6 +28,16 @@ func transferRecoveryOwnership(ctx context.Context, directory string, uid, gid i
 	err := filepath.WalkDir(directory, func(path string, item fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
+		}
+		// Only the material this plane restores moves to the deployment
+		// account. Historical backups parked beside it (previous binaries,
+		// quarantined stages, input copies) are dead weight: asserting on them
+		// makes an upgrade fail because of files no transaction will read.
+		if item.IsDir() && path != directory && !recoveryScopeDir(directory, path) {
+			return filepath.SkipDir
+		}
+		if !item.IsDir() && path != directory && !recoveryScopeFile(directory, path) {
+			return nil
 		}
 		if err := ctx.Err(); err != nil {
 			return err
@@ -58,6 +69,27 @@ func transferRecoveryOwnership(ctx context.Context, directory string, uid, gid i
 		}
 	}
 	return syncDir(filepath.Dir(directory))
+}
+
+// recoveryScopeDir reports whether a subdirectory under the recovery root
+// belongs to the deployment plane.
+func recoveryScopeDir(directory, path string) bool {
+	relative, err := filepath.Rel(directory, path)
+	if err != nil {
+		return false
+	}
+	return relative == "rqlite-recovery"
+}
+
+// recoveryScopeFile reports whether a file directly under the recovery root is
+// a migration snapshot or a recovery receipt/pruning record.
+func recoveryScopeFile(directory, path string) bool {
+	relative, err := filepath.Rel(directory, path)
+	if err != nil {
+		return false
+	}
+	base := filepath.Base(relative)
+	return strings.HasPrefix(base, "migration-") && strings.HasSuffix(base, ".sqlite3")
 }
 
 func chownRecoveryEntry(path string, expected fs.FileInfo, uid, gid int) error {
