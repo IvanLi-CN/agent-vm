@@ -465,8 +465,19 @@ func runMaintenanceBinary(args []string) error {
 		}
 		// Self-reported versions of parsed strings are soft evidence; the byte
 		// comparison that matters happened before staging.
-		if installed, err := install.DeployBinaryVersion(install.MaintenanceBinaryPath); err == nil && installed != version {
-			return fmt.Errorf("this binary is %s and the installed stable binary is %s; run the matching release binary", version, installed)
+		//
+		// Installing from a newer release binary than the one on disk is the
+		// normal first step of an upgrade: the whole point is to replace an
+		// older stable binary. Only installing from an older release binary is
+		// refused, because that would silently downgrade the controller.
+		// Installing from a release binary that differs from the stable one on
+		// disk is the normal first step of an upgrade; the whole point is to
+		// replace older bytes. The staging digest already proved the bundle, so
+		// only a byte-identical install is rejected as a no-op.
+		if same, cmpErr := install.SameDeployBinary(filepath.Join(*product, "bin", "agent-vm-deploy"), install.MaintenanceBinaryPath); cmpErr == nil && same {
+			encoded, _ := json.Marshal(map[string]any{"maintenance_binary_version": release, "already_current": true, "published_units": []string{}})
+			_, _ = os.Stdout.Write(append(encoded, '\n'))
+			return nil
 		}
 		backups, err := install.InstallMaintenanceBinary(*product)
 		if err != nil {

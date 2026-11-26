@@ -146,3 +146,19 @@ func publishUnitSources(product, materials string) error {
 	_, err = publishHostUnits(merged, outputUnitRoot)
 	return err
 }
+
+// SameDeployBinary reports whether two deploy binaries hold identical bytes.
+func SameDeployBinary(candidate, installed string) (bool, error) {
+	next, err := os.ReadFile(candidate)
+	if err != nil {
+		return false, err
+	}
+	current, err := os.ReadFile(installed)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return string(next) == string(current), nil
+}
