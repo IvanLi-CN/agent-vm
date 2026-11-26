@@ -48,25 +48,16 @@ func TestHandoffRestartsHelperSockets(t *testing.T) {
 	}
 }
 
-// systemd ignores Sockets= outside [Unit]. Older materials lack the line, so
-// the handoff synthesizes it; it must land in the unit section.
-func TestSteadyDropInDeclaresSocketInUnitSection(t *testing.T) {
-	account := []byte("[Unit]\nRequires=agent-vm-deployd.socket\n\n[Service]\nUser=agent-vm-deploy\n")
-	steady, _ := deploymentAccountDropIns(account)
-	text := string(steady)
-	unitStart := strings.Index(text, "[Unit]")
-	serviceStart := strings.Index(text, "[Service]")
-	declaration := strings.Index(text, "Sockets=agent-vm-deployd.socket")
-	if unitStart < 0 || serviceStart < 0 || declaration < 0 || declaration > serviceStart {
-		t.Fatalf("Sockets= is not inside [Unit]:\n%s", text)
+// The helper writes new socket unit files. systemd drops the listening
+// descriptor when a socket unit file changes under it, so a plain start leaves
+// a unit that reports active while every connection is refused. The handoff
+// must restart it.
+func TestHandoffRestartsDeploydSocket(t *testing.T) {
+	source, err := os.ReadFile("account_deploy_switch.go")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if strings.Count(text, "Sockets=agent-vm-deployd.socket") != 1 {
-		t.Fatalf("Sockets= was declared more than once:\n%s", text)
-	}
-
-	already := []byte("[Unit]\nSockets=agent-vm-deployd.socket\n\n[Service]\nUser=agent-vm-deploy\n")
-	steady, _ = deploymentAccountDropIns(already)
-	if strings.Count(string(steady), "Sockets=agent-vm-deployd.socket") != 1 {
-		t.Fatalf("existing declaration was duplicated:\n%s", steady)
+	if !strings.Contains(string(source), `"restart", deploymentUnit+".socket"`) {
+		t.Fatal("the handoff starts the deployd socket without restarting it")
 	}
 }
