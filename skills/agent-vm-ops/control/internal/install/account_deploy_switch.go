@@ -82,7 +82,13 @@ func handoffDeploymentUnit(ctx context.Context, handoff deployd.AccountHandoff, 
 		if err := command(ctx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
 			return err
 		}
-		return command(ctx, "/usr/bin/systemctl", "start", deploymentUnit)
+		// The dedicated deployd inherits its listening socket from systemd, so it
+		// must be socket-activated. Starting the service unit alone hands it no
+		// activation descriptor and serve exits with an unprivileged-listener error.
+		if err := command(ctx, "/usr/bin/systemctl", "start", deploymentUnit+".socket"); err != nil {
+			return err
+		}
+		return nil
 	})
 	return result
 }
@@ -186,9 +192,32 @@ func prepareHandoffAccount(ctx context.Context, input Inputs) error {
 
 func deploymentAccountDropIns(account []byte) (steady, adopt []byte) {
 	const command = migrationDeployBinary + " serve --config /etc/agent-vm-native/deployd.json"
-	steady = append(bytes.Clone(account), []byte("\n[Service]\nExecStart=\nExecStart="+command+"\n")...)
+	// The dedicated deployd must inherit its listening socket from systemd: an
+	// unprivileged process cannot create the root-owned socket itself, and serve
+	// refuses to start without the activation descriptor. Older materials that
+	// predate this declaration are upgraded here so any candidate release works.
+	body := accountDropInWithSockets(account)
+	steady = append(body, []byte("\n[Service]\nExecStart=\nExecStart="+command+"\n")...)
 	adopt = []byte("[Service]\nExecStart=\nExecStart=" + command + " --adopt-account-handoff\n")
 	return
+}
+
+// accountDropInWithSockets guarantees the steady unit is socket-activated
+// without duplicating a declaration the materials already carry.
+func accountDropInWithSockets(account []byte) []byte {
+	declaration := []byte("Sockets=agent-vm-deployd.socket")
+	if bytes.Contains(account, declaration) {
+		return bytes.Clone(account)
+	}
+	// systemd only honours Sockets= inside the [Unit] section, so insert it at
+	// the end of that section rather than appending to the whole file.
+	if at := bytes.Index(account, []byte("\n[")); at >= 0 {
+		out := append([]byte{}, account[:at]...)
+		out = append(out, '\n')
+		out = append(out, declaration...)
+		return append(out, account[at:]...)
+	}
+	return append(append(bytes.Clone(account), '\n'), declaration...)
 }
 
 func removeAccountHandoffDropIn(path string, expected []byte) error {

@@ -47,3 +47,26 @@ func TestHandoffRestartsHelperSockets(t *testing.T) {
 		t.Fatal("the handoff starts the helper sockets without restarting them")
 	}
 }
+
+// systemd ignores Sockets= outside [Unit]. Older materials lack the line, so
+// the handoff synthesizes it; it must land in the unit section.
+func TestSteadyDropInDeclaresSocketInUnitSection(t *testing.T) {
+	account := []byte("[Unit]\nRequires=agent-vm-deployd.socket\n\n[Service]\nUser=agent-vm-deploy\n")
+	steady, _ := deploymentAccountDropIns(account)
+	text := string(steady)
+	unitStart := strings.Index(text, "[Unit]")
+	serviceStart := strings.Index(text, "[Service]")
+	declaration := strings.Index(text, "Sockets=agent-vm-deployd.socket")
+	if unitStart < 0 || serviceStart < 0 || declaration < 0 || declaration > serviceStart {
+		t.Fatalf("Sockets= is not inside [Unit]:\n%s", text)
+	}
+	if strings.Count(text, "Sockets=agent-vm-deployd.socket") != 1 {
+		t.Fatalf("Sockets= was declared more than once:\n%s", text)
+	}
+
+	already := []byte("[Unit]\nSockets=agent-vm-deployd.socket\n\n[Service]\nUser=agent-vm-deploy\n")
+	steady, _ = deploymentAccountDropIns(already)
+	if strings.Count(string(steady), "Sockets=agent-vm-deployd.socket") != 1 {
+		t.Fatalf("existing declaration was duplicated:\n%s", steady)
+	}
+}
