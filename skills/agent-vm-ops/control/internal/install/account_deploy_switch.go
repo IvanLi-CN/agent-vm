@@ -22,6 +22,8 @@ import (
 
 const deploymentUnit = "agent-vm-deployd.service"
 
+const deploydSocketUnit = "agent-vm-deployd.socket"
+
 // handoffDeploymentUnit keeps the incumbent unit definition in place up to
 // the point the journal transfer succeeds. The passed materials are from the
 // verified, private installation snapshot.
@@ -89,7 +91,7 @@ func handoffDeploymentUnit(ctx context.Context, handoff deployd.AccountHandoff, 
 		// restart, not start: systemd drops the listening descriptor when a
 		// socket unit's file changed under it, leaving a unit that reports
 		// active while every connect is refused.
-		if err := command(ctx, "/usr/bin/systemctl", "restart", deploymentUnit+".socket"); err != nil {
+		if err := command(ctx, "/usr/bin/systemctl", "restart", deploydSocketUnit); err != nil {
 			return err
 		}
 		return nil
