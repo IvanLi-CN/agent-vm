@@ -43,8 +43,10 @@ var hostSocketAssets = []string{
 //
 // Idempotent: equal protected files are left alone, so this is safe to run
 // before every transaction.
+const outputUnitRoot = "/etc/systemd/system"
+
 func PublishHostUnits(product string) ([]string, error) {
-	return publishHostUnits(product, "/etc/systemd/system")
+	return publishHostUnits(product, outputUnitRoot)
 }
 
 func publishHostUnits(product, targetRoot string) ([]string, error) {
@@ -56,8 +58,13 @@ func publishHostUnitsInto(product, targetRoot string, protectParents bool) ([]st
 	var changed []string
 	for _, name := range hostUnitAssets {
 		source := filepath.Join(units, name)
-		if _, err := os.Lstat(source); err != nil {
-			return changed, fmt.Errorf("release product lacks %s: %w", name, err)
+		if _, err := os.Lstat(source); errors.Is(err, os.ErrNotExist) {
+			// The product bundle carries a subset of the units; the rest live in
+			// deployment materials, which `update` does not take. Publish what
+			// the bundle has and leave the others to `install`.
+			continue
+		} else if err != nil {
+			return changed, fmt.Errorf("inspect %s: %w", name, err)
 		}
 		target := filepath.Join(targetRoot, name)
 		replaced, err := replaceUnitAsset(source, target, protectParents)
@@ -110,4 +117,32 @@ func replaceUnitAsset(source, target string, protectParents bool) (bool, error) 
 		return false, err
 	}
 	return true, syncDir(filepath.Dir(target))
+}
+
+// publishUnitSources merges the product tree and deployment materials and
+// publishes every unit either one provides. Product units win when both carry
+// the same name.
+func publishUnitSources(product, materials string) error {
+	merged, err := os.MkdirTemp("", "agent-vm-merged-units-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(merged)
+	destination := filepath.Join(merged, "systemd")
+	if err := os.MkdirAll(destination, 0o755); err != nil {
+		return err
+	}
+	for _, source := range []string{filepath.Join(materials, "assets/systemd"), filepath.Join(product, "systemd")} {
+		for _, name := range hostUnitAssets {
+			content, readErr := os.ReadFile(filepath.Join(source, name))
+			if readErr != nil {
+				continue
+			}
+			if err := os.WriteFile(filepath.Join(destination, name), content, 0o644); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = publishHostUnits(merged, outputUnitRoot)
+	return err
 }

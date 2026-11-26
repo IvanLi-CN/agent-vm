@@ -472,7 +472,28 @@ func runMaintenanceBinary(args []string) error {
 		if err != nil {
 			return err
 		}
-		encoded, _ := json.Marshal(map[string]any{"maintenance_binary_version": release, "backups": backups})
+		// This is the earliest point where the new release's own binary is on
+		// disk and running, so it is the first chance to publish the units the
+		// release carries. Slot drop-ins never override ExecStartPre or
+		// ExecStartPost, so a host that keeps the old singleton keeps starting
+		// the old adapter until these bytes are replaced.
+		published, err := install.PublishHostUnits(*product)
+		if err != nil {
+			return fmt.Errorf("publish host units: %w", err)
+		}
+		if len(published) > 0 {
+			if err := exec.Command("/usr/bin/systemctl", "daemon-reload").Run(); err != nil {
+				return fmt.Errorf("reload published host units: %w", err)
+			}
+			for _, name := range published {
+				if strings.HasSuffix(name, ".socket") {
+					if err := exec.Command("/usr/bin/systemctl", "restart", name).Run(); err != nil {
+						return fmt.Errorf("restart published socket %s: %w", name, err)
+					}
+				}
+			}
+		}
+		encoded, _ := json.Marshal(map[string]any{"maintenance_binary_version": release, "backups": backups, "published_units": published})
 		_, _ = os.Stdout.Write(append(encoded, '\n'))
 		return nil
 	}

@@ -396,6 +396,42 @@ func installBackupInputs(cfg Config) error {
 	return installFile(migration.RQLiteBackupCA, ca, 0640, "agent-vm-deploy")
 }
 
+// publishInstalledHostUnits refreshes the units delivered by the candidate
+// bundle and materials on an existing host. Product units and material units
+// are merged: the bundle carries the slot and deployd units, the materials
+// carry the helper, socket and request units.
+func publishInstalledHostUnits(input Inputs) error {
+	product, err := os.MkdirTemp("", "agent-vm-units-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(product)
+	file, err := os.Open(input.Bundle)
+	if err != nil {
+		return err
+	}
+	err = Extract(file, product, 1<<30)
+	file.Close()
+	if err != nil {
+		return err
+	}
+	if err := publishUnitSources(product, input.Materials); err != nil {
+		return err
+	}
+	if err := command(context.Background(), "systemctl", "daemon-reload"); err != nil {
+		return err
+	}
+	for _, name := range hostSocketAssets {
+		if _, statErr := os.Lstat(filepath.Join(outputUnitRoot, name)); statErr != nil {
+			continue
+		}
+		if err := command(context.Background(), "systemctl", "restart", name); err != nil {
+			return fmt.Errorf("restart published socket %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
 func finishExisting(ctx context.Context, report Report, input Inputs) (Report, error) {
 	client := deployd.Client{Socket: "/run/agent-vm-native/deployd.sock", Timeout: 30 * time.Second}
 	payload, _, err := client.Call(ctx, "GET", "/v1/status", nil)
@@ -415,6 +451,13 @@ func finishExisting(ctx context.Context, report Report, input Inputs) (Report, e
 	active, ok := snapshot.Slots[snapshot.ActiveSlot]
 	if len(status.Value.Transactions) != 0 || !ok || !snapshot.Consistent || !snapshot.FreshUntil.After(time.Now()) || snapshot.ControllerSlot != snapshot.ActiveSlot || !active.Ready || !active.ControllerOwned || !active.TrafficAccepting {
 		return report, errors.New("existing installation is not verified ready; inspect Deployd status and recovery transactions")
+	}
+	// An already-installed host still needs the release-owned units it carries.
+	// `install` is the only entrypoint that reaches them: `update` runs the
+	// previous maintenance binary, so it cannot publish the units its own
+	// release introduced.
+	if err := publishInstalledHostUnits(input); err != nil {
+		return report, err
 	}
 	data, err := protectedRead(recordPath)
 	if errors.Is(err, os.ErrNotExist) {
