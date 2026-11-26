@@ -1728,6 +1728,52 @@ func (manager *Manager) rollbackOrFence(ctx context.Context, transaction store.T
 	return cause
 }
 
+// recordExhaustedRollback closes a rollback whose replacement never started.
+// The incumbent still serves with the only controller lease and the previous
+// slot is provably stopped, so nothing is in doubt: the transaction ends as
+// `failed`, which does not block later deployments, instead of as
+// `needs_recovery` behind a fence and manual recovery. It returns nil once the
+// terminal record is durable.
+func (manager *Manager) recordExhaustedRollback(ctx context.Context, transaction store.Transaction, cause error, current RuntimeSnapshot) error {
+	// PhaseRollback maps to state_unverified, so the plain failure record would
+	// re-fence the host. Write the terminal state directly.
+	if _, err := manager.Store.Transition(ctx, transaction.ID, PhaseRollback, PhaseRollback, "failed",
+		"rollback_start_attempts_exhausted", "deployd", map[string]any{
+			"active_slot":      current.ActiveSlot,
+			"deployer_service": "deployd",
+		}, manager.Clock().UTC()); err != nil {
+		return fmt.Errorf("record exhausted rollback: %w", err)
+	}
+	payload := failurePayload(cause)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(encoded)
+	if err := manager.Store.RecordFailure(ctx, transaction.ID, PhaseRollback, "rollback_previous_unavailable",
+		"deployd", hex.EncodeToString(digest[:]), payload, manager.Clock().UTC()); err != nil {
+		return fmt.Errorf("record exhausted rollback cause: %w", err)
+	}
+	return &TransactionError{ID: transaction.ID, Phase: PhaseRollback, Cause: cause}
+}
+
+// failurePayload mirrors the message/uncertain shape used by failure().
+func failurePayload(cause error) map[string]any {
+	payload := map[string]any{"message": "previous version failed to start; current slot remains active", "uncertain": false}
+	if sanitized := sanitizedFailureCause(cause); sanitized != "" {
+		payload["cause"] = sanitized
+		payload["cause_type"] = fmt.Sprintf("%T", cause)
+	}
+	return payload
+}
+
+// isRecordingProblem reports whether a helper result is a bookkeeping failure
+// rather than the terminal transaction error it produced.
+func isRecordingProblem(err error) bool {
+	var transactionErr *TransactionError
+	return err != nil && !errors.As(err, &transactionErr)
+}
+
 func (manager *Manager) rollback(ctx context.Context, transaction store.Transaction) error {
 	if transaction.State == "failed" && transaction.RollbackUsed {
 		return errors.New("rollback is already finished")
@@ -1777,7 +1823,10 @@ func (manager *Manager) rollback(ctx context.Context, transaction store.Transact
 				current, observeErr := manager.observe(ctx, transaction.ID)
 				incumbent := current.Slots[transaction.TargetSlot]
 				standby := current.Slots[transaction.PreviousSlot]
-				stopped := standby.CountersKnown
+				// A stopped slot has no counters to read, so CountersKnown is false
+				// there. Judge on the absence of process and roles; fall back to the
+				// runtime verifier when the observation still claims a process.
+				stopped := !standby.ProcessUp && !standby.ControllerOwned && !standby.TrafficAccepting
 				if verifier, ok := manager.Runtime.(interface {
 					verifyFailedRollbackSlotStopped(context.Context, string) bool
 				}); !stopped && ok {
@@ -1788,12 +1837,13 @@ func (manager *Manager) rollback(ctx context.Context, transaction store.Transact
 					incumbent.Ready && incumbent.ControllerOwned && incumbent.TrafficAccepting &&
 					incumbent.StateAuthority == previousAuthority && stopped &&
 					!standby.ProcessUp && !standby.ControllerOwned && !standby.TrafficAccepting {
-					_, recordErr := manager.Store.Transition(ctx, transaction.ID, PhaseRollback, PhaseRollback, "failed",
-						"rollback_start_attempts_exhausted", "deployd", map[string]any{"active_slot": current.ActiveSlot}, manager.Clock().UTC())
-					if recordErr == nil {
-						return &TransactionError{ID: transaction.ID, Phase: PhaseRollback, Cause: err}
+					// The helper records the terminal state and returns the
+					// transaction error; anything else is a recording problem.
+					if recordingErr := manager.recordExhaustedRollback(ctx, transaction, err, current); !isRecordingProblem(recordingErr) {
+						return recordingErr
+					} else {
+						err = errors.Join(err, recordingErr)
 					}
-					err = errors.Join(err, recordErr)
 				}
 			}
 			return manager.effectFailure(ctx, transaction.ID, PhaseRollback, err)

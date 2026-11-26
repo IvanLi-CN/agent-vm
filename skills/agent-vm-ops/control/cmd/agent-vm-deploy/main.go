@@ -236,6 +236,9 @@ func runUpdate(args []string) error {
 	}
 	defer updateLock.Close()
 	client := deployd.Client{Socket: *socket, Timeout: 15 * time.Minute}
+	// The dedicated account migration is a hardening step, not a prerequisite.
+	// An install that still runs deployd as root upgrades through the same
+	// blue-green transaction; `status` reports which form is in effect.
 	if *socket == deployd.Defaults().Socket {
 		payload, _, err := client.Call(ctx, "GET", "/v1/status", nil)
 		if err != nil {
@@ -243,7 +246,7 @@ func runUpdate(args []string) error {
 			return err
 		}
 		if !dedicatedUpdateReady(payload) {
-			return errors.New("host permission migration required before updating; see deploy/docs/blue-green.md")
+			fmt.Fprintln(os.Stderr, `{"code":"deployment_runs_as_root","retryable":false,"reason":"deployd still runs as root","next_action":"optional: agent-vm-deploy install --check-account-migration then --apply"}`)
 		}
 	}
 	const stagingRoot = "/var/lib/agent-vm-native/release-staging"
@@ -291,6 +294,34 @@ func runUpdate(args []string) error {
 	if status.Value.Observation.ActiveSlot == "blue" {
 		targetSlot = "green"
 	}
+	// Refresh the units a transaction cannot carry. The slot drop-ins leave
+	// ExecStartPre/ExecStartPost untouched, so a host whose singleton template
+	// still names the previous maintenance binary keeps starting that binary;
+	// the same applies to the request adapter's privilege flags. Publishing is
+	// idempotent and happens before the effect barrier.
+	product, err := os.MkdirTemp(directory, ".units-")
+	if err == nil {
+		published, publishErr := publishHostUnits(bundle, product)
+		_ = os.RemoveAll(product)
+		if publishErr != nil {
+			return publishErr
+		}
+		if len(published) > 0 {
+			if err := exec.Command("/usr/bin/systemctl", "daemon-reload").Run(); err != nil {
+				return fmt.Errorf("reload published host units: %w", err)
+			}
+			// systemd drops the listening descriptor when a socket unit file
+			// changes underneath it, leaving a unit that reports active while
+			// every connect is refused.
+			for _, name := range published {
+				if strings.HasSuffix(name, ".socket") {
+					if err := exec.Command("/usr/bin/systemctl", "restart", name).Run(); err != nil {
+						return fmt.Errorf("restart published socket %s: %w", name, err)
+					}
+				}
+			}
+		}
+	}
 	// Keep candidate bytes after any request that may have crossed the effect barrier.
 	preserveStaging = true
 	receipt, err := client.RunBlueGreen(ctx, targetSlot, bundle)
@@ -316,6 +347,24 @@ func runUpdate(args []string) error {
 	}
 	writeMaintenanceStatus(payload)
 	return nil
+}
+
+// publishHostUnits extracts the candidate tree and refreshes the release-owned
+// units from it, returning the names that actually changed.
+func publishHostUnits(bundle, product string) ([]string, error) {
+	file, err := os.Open(bundle)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	if err := install.Extract(file, product, 256<<20); err != nil {
+		return nil, err
+	}
+	published, err := install.PublishHostUnits(product)
+	if err != nil {
+		return published, fmt.Errorf("publish host units: %w", err)
+	}
+	return published, nil
 }
 
 // writeMaintenanceStatus names the host actions that the blue-green

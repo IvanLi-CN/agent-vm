@@ -128,6 +128,7 @@
 - `docs/proposals/agent-vm-web-console.md`：管理台产品研究。
 - `docs/proposals/agent-vm-web-demo.md`：Demo 表面研究。
 - `docs/proposals/agent-vm-wide-screen-layout.md`：宽屏布局研究。
+- `docs/proposals/agent-vm-deployment-robustness.md`：既有安装的升级与部署健壮性诊断与方案。
 - `docs/proposals/ci-optimization-design.md`：CI 优化研究。
 
 ### 解决经验：索引访问
