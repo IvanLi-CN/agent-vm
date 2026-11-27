@@ -446,6 +446,21 @@ func Encode(value any) ([]byte, error) {
 	return json.Marshal(value)
 }
 
+// reasonLimit names the actions that may carry an operator note and the
+// character budget each enforces. admin-reconcile-history required a reason
+// before request validation knew the field existed; rejecting it here would
+// make that recovery action unusable.
+func reasonLimit(action string) (int, bool) {
+	switch action {
+	case "admin-reconcile-history":
+		return 500, true
+	case "pin", "unpin":
+		return 512, true
+	default:
+		return 0, false
+	}
+}
+
 func ValidateRequest(request Request) *Error {
 	protocol, ok := integer(request["protocol"])
 	if !ok || protocol != Version {
@@ -493,8 +508,9 @@ func ValidateRequest(request Request) *Error {
 	}
 	if raw, exists := request["reason"]; exists {
 		value, ok := raw.(string)
-		if !ok || !utf8.ValidString(value) || utf8.RuneCountInString(value) > 512 || strings.TrimSpace(value) == "" || (action != "pin" && action != "unpin") {
-			return NewError("invalid_request", "reason is only valid as a non-empty pin or unpin note of at most 512 characters", nil)
+		limit, allowed := reasonLimit(action)
+		if !ok || !utf8.ValidString(value) || !allowed || strings.TrimSpace(value) == "" || utf8.RuneCountInString(value) > limit {
+			return NewError("invalid_request", "reason is only valid as a non-empty pin, unpin or admin-reconcile-history note within its character limit", nil)
 		}
 	} else if action == "pin" {
 		return NewError("invalid_request", "pin requires a non-empty reason", nil)

@@ -328,7 +328,7 @@ func writeError(c *gin.Context, err error, request protocol.Request) {
 		if control.Code == "request_too_large" {
 			status = http.StatusRequestEntityTooLarge
 		}
-	case "draining", "operation_conflict", "operation_incomplete", "generation_mismatch", "lease_expired", "controller_lease_required", "task_missing", "task_not_active", "task_transition", "cache_ineligible", "resource_insufficient":
+	case "draining", "operation_conflict", "operation_incomplete", "generation_mismatch", "lease_expired", "lease_pinned", "already_pinned", "not_pinned", "controller_lease_required", "task_missing", "task_not_active", "task_transition", "cache_ineligible", "resource_insufficient":
 		status = http.StatusConflict
 	case "startup_reconcile_required", "state_unverified", "sqlite_unavailable", "observation_unavailable", "resource_unverified", "resource_pressure", "mapping_unverified", "ownership_mismatch", "guest_host_key_missing", "watermarks_unreachable":
 		status = http.StatusServiceUnavailable
