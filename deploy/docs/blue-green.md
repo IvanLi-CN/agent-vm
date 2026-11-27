@@ -155,7 +155,9 @@ sudo "$deploy_cli" maintenance-binary --restart
 
 `--install` 会把旧二进制保留为 `<maintenance>.previous`；`--restart` 以磁盘上安装的二进制为准，重启后轮询 `/v1/status` 确认服务真的可用，未就绪时报错。两步之间没有事务，deployd 重启后必须重新执行 `status`、`doctor` 和 `admin status` 再宣称更新完成。
 
-蓝绿事务不刷新两个槽位的 `config.json`。早期安装写入的租期字段会在升级后原样保留：`max_lease_seconds` 曾按更窄的边界写入（例如 `7200`），升级到允许 `21600` 的版本后，显式 `renew --lease 6h` 仍会被控制端以 `invalid_request` 拒绝，`detail.maximum_seconds` 等于该槽配置值而不是代码默认值。判定续期范围时，先读现役槽的 `initial_lease_seconds`、`renew_seconds`、`max_lease_seconds`，确认它们仍符合预期；需要变更时同时改两个槽的配置并重启现役槽，不要只改一个槽。
+蓝绿事务不刷新两个槽位的 `config.json`。早期安装把 `initial_lease_seconds`、`renew_seconds`、`max_lease_seconds` 按当时的边界写进了文件（例如 `max_lease_seconds` 为 `7200`），升级后这些键原样保留并覆盖代码缺省值，显式 `renew --lease 6h` 仍会被拒，`detail.maximum_seconds` 等于该槽配置值。
+
+这三个字段都是可选的。要让槽位跟随代码缺省值（`1800 / 1800 / 21600`），从两个槽的 `config.json` 中删掉这些键，而不是写入当前的缺省值；只有需要偏离缺省值时才显式写出。改完两个槽后重启现役槽使其生效。Deployd 会自行重新绑定重启后槽位的进程身份，无需重启 `agent-vm-deployd.service`；看到 `pinned controller process changed` 并不表示需要人工介入。
 
 恢复点预算为三个已验证恢复点，最新两个、有效租约、回退目标和未完成事务始终受保护；最旧的点不在这些保护范围内即可回收，年龄不影响判定。满额且全部受保护时返回 `backup_storage_exhausted`，现役槽继续服务。不要手工移动目录，先查看预算并按需清理：
 
