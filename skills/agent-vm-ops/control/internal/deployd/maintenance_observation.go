@@ -32,8 +32,23 @@ func (runtime *HostRuntime) CurrentOwnedControllerLease(ctx context.Context) (co
 		return controllerrole.Lease{}, false, err
 	}
 	process, processOK := processIdentityFromHealth(body)
-	if (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) || body["process_ready"] != true || !processOK || process != pinned {
+	if (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) || body["process_ready"] != true || !processOK {
 		return controllerrole.Lease{}, false, errors.New("pinned controller process changed")
+	}
+	if process != pinned {
+		// A slot restart replaces the process behind an otherwise healthy socket.
+		// The pin records the process deployd last verified; it is not evidence of
+		// a conflict. Returning an error here fences both roles on every heartbeat
+		// forever, because the only path that refreshes a pin runs after an
+		// observation succeeds. Drop the stale pin and report no authority instead;
+		// PrepareControllerRenewal revalidates the release identity, systemd process
+		// and socket link before re-pinning the new process.
+		runtime.mu.Lock()
+		if current, present := runtime.stagedProcess[slot]; present && current == pinned {
+			delete(runtime.stagedProcess, slot)
+		}
+		runtime.mu.Unlock()
+		return controllerrole.Lease{}, false, nil
 	}
 	if body["controller_owned"] != true || body["controller_lease_renewal"] != true {
 		return controllerrole.Lease{}, false, nil

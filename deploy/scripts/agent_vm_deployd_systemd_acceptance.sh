@@ -538,4 +538,46 @@ fi
 systemctl stop agent-vm-deployd.service agent-vm-native@blue.service agent-vm-native@green.service
 AGENT_VM_ROLLBACK_CRASH_TEST=1 go -C "$control_root" test -count=1 ./internal/deployd -run '^TestRealSystemdRollbackCrashBudget$' -v
 
-printf '{"schema_version":1,"verdict":"pass","systemd":"real","slot_runtime":"testslot-adapter","real_control_binary":"version-smoke-passed","slots":"dual-process-and-uds","switch":"green","restart_recovery":"needs_recovery-and-bounded-rollback","state_markers":"informational","metrics":"single-deployd-endpoint"}\n'
+# A slot restart replaces the process behind a healthy socket. Deployd must drop
+# the stale pin and re-pin the new process by itself; requiring an operator to
+# restart agent-vm-deployd.service leaves the host fenced until someone notices.
+systemctl start agent-vm-deployd.service agent-vm-native@green.service
+wait_active agent-vm-deployd.service || fail "Deployd did not restart for the slot pin proof"
+wait_active agent-vm-native@green.service || fail "active slot did not restart for the slot pin proof"
+for _ in $(seq 1 100); do
+  if [[ -S /run/agent-vm-native/deployd.sock ]] && curl --fail --silent --max-time 2 "http://127.0.0.1:$metrics_port/metrics" 2>/dev/null | grep -Fq 'agent_vm_deployd_slot_controller_owned{slot="green"} 1'; then
+    break
+  fi
+  sleep 0.2
+done
+before_restart_pid="$(systemctl show agent-vm-native@green.service --property=MainPID --value)"
+systemctl restart agent-vm-native@green.service
+wait_active agent-vm-native@green.service || fail "active slot did not survive its restart"
+after_restart_pid="$(systemctl show agent-vm-native@green.service --property=MainPID --value)"
+[[ "$after_restart_pid" != "$before_restart_pid" ]] || fail "slot restart did not replace the process, so the pin proof is vacuous"
+recovered=0
+for _ in $(seq 1 150); do
+  if ! systemctl is-active --quiet agent-vm-deployd.service; then
+    break
+  fi
+  if curl --fail --silent --max-time 2 "http://127.0.0.1:$metrics_port/metrics" 2>/dev/null | grep -Fq 'agent_vm_deployd_slot_controller_owned{slot="green"} 1'; then
+    recovered=1
+    break
+  fi
+  sleep 0.2
+done
+[[ "$recovered" == 1 ]] || fail "controller authority did not return after the slot restarted; the stale pin still fences the host"
+status_json="$(/opt/agent-vm-native/bin/agent-vm-deploy status --json)"
+python3 - "$status_json" <<'PY'
+import json
+import sys
+
+observation = json.loads(sys.argv[1])["value"]["observation"]
+if observation["active_slot"] != "green" or observation["controller_slot"] != "green":
+    raise SystemExit("slot restart did not restore green controller authority")
+if sum(1 for slot in observation["slots"].values() if slot.get("controller_owned")) != 1:
+    raise SystemExit("controller ownership is not unique after the slot restart")
+PY
+printf '%s\n' 'slot restart kept controller authority without restarting deployd'
+
+printf '{"schema_version":1,"verdict":"pass","systemd":"real","slot_runtime":"testslot-adapter","real_control_binary":"version-smoke-passed","slots":"dual-process-and-uds","switch":"green","restart_recovery":"needs_recovery-and-bounded-rollback","slot_restart":"controller-recovered-without-deployd-restart","state_markers":"informational","metrics":"single-deployd-endpoint"}\n'
