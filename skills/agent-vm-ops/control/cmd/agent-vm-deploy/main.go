@@ -299,34 +299,14 @@ func runUpdate(args []string) error {
 	// still names the previous maintenance binary keeps starting that binary;
 	// the same applies to the request adapter's privilege flags. Publishing is
 	// idempotent and happens before the effect barrier.
-	// Expose verified bundle hands the staging directory to the deployment
-	// account, so it can no longer host a root-owned extraction. Use a private
-	// temporary tree instead.
-	productRoot, err := os.MkdirTemp("", "agent-vm-units-")
-	if err == nil {
-		// Extract creates its destination itself and therefore requires an
-		// absent path; hand it a fresh child rather than the temp root.
-		product := filepath.Join(productRoot, "product")
-		published, publishErr := publishHostUnits(bundle, product)
-		_ = os.RemoveAll(productRoot)
-		if publishErr != nil {
-			return publishErr
-		}
-		if len(published) > 0 {
-			if err := exec.Command("/usr/bin/systemctl", "daemon-reload").Run(); err != nil {
-				return fmt.Errorf("reload published host units: %w", err)
-			}
-			// systemd drops the listening descriptor when a socket unit file
-			// changes underneath it, leaving a unit that reports active while
-			// every connect is refused.
-			for _, name := range published {
-				if strings.HasSuffix(name, ".socket") {
-					if err := exec.Command("/usr/bin/systemctl", "restart", name).Run(); err != nil {
-						return fmt.Errorf("restart published socket %s: %w", name, err)
-					}
-				}
-			}
-		}
+	// exposeVerifiedBundle hands the staging directory to the deployment account,
+	// so it can no longer host a root-owned extraction. The extracted product is
+	// therefore placed outside the staging tree. Extract also creates its
+	// destination itself, so the helper receives an absent child.
+	if published, publishErr := publishCandidateHostUnits(bundle); publishErr != nil {
+		return publishErr
+	} else if err := activatePublishedUnits(published); err != nil {
+		return err
 	}
 	// Keep candidate bytes after any request that may have crossed the effect barrier.
 	preserveStaging = true
@@ -358,6 +338,12 @@ func runUpdate(args []string) error {
 // publishHostUnits extracts the candidate tree and refreshes the release-owned
 // units from it, returning the names that actually changed.
 func publishHostUnits(bundle, product string) ([]string, error) {
+	return publishHostUnitsWith(bundle, product, install.PublishHostUnits)
+}
+
+// publishHostUnitsWith keeps the extraction target and the publish step
+// injectable so the staging-tree bug stays covered without root.
+func publishHostUnitsWith(bundle, product string, publish func(string) ([]string, error)) ([]string, error) {
 	file, err := os.Open(bundle)
 	if err != nil {
 		return nil, err
@@ -366,11 +352,57 @@ func publishHostUnits(bundle, product string) ([]string, error) {
 	if err := install.Extract(file, product, 256<<20); err != nil {
 		return nil, err
 	}
-	published, err := install.PublishHostUnits(product)
+	published, err := publish(product)
 	if err != nil {
 		return published, fmt.Errorf("publish host units: %w", err)
 	}
 	return published, nil
+}
+
+// publishCandidateHostUnits extracts a verified bundle outside the staging tree
+// and refreshes the release-owned units from it. The staging directory has
+// already been handed to the deployment account, so a root-owned extraction
+// there fails; Extract also creates its destination and requires it to be
+// absent, hence the fresh child rather than the temporary root.
+func publishCandidateHostUnits(bundle string) ([]string, error) {
+	return publishCandidateHostUnitsWith(bundle, install.PublishHostUnits)
+}
+
+func publishCandidateHostUnitsWith(bundle string, publish func(string) ([]string, error)) ([]string, error) {
+	productRoot, err := os.MkdirTemp("", "agent-vm-units-")
+	if err != nil {
+		return nil, fmt.Errorf("create unit extraction root: %w", err)
+	}
+	defer os.RemoveAll(productRoot)
+	return publishHostUnitsWith(bundle, filepath.Join(productRoot, "product"), publish)
+}
+
+// activatePublishedUnits reloads systemd after a unit change and restarts every
+// published socket. systemd drops the listening descriptor when a socket unit
+// file changes underneath it, leaving a unit that reports active while every
+// connect is refused.
+func activatePublishedUnits(published []string) error {
+	return activatePublishedUnitsWith(published, func(args ...string) error {
+		return exec.Command("/usr/bin/systemctl", args...).Run()
+	})
+}
+
+func activatePublishedUnitsWith(published []string, run func(...string) error) error {
+	if len(published) == 0 {
+		return nil
+	}
+	if err := run("daemon-reload"); err != nil {
+		return fmt.Errorf("reload published host units: %w", err)
+	}
+	for _, name := range published {
+		if !strings.HasSuffix(name, ".socket") {
+			continue
+		}
+		if err := run("restart", name); err != nil {
+			return fmt.Errorf("restart published socket %s: %w", name, err)
+		}
+	}
+	return nil
 }
 
 // writeMaintenanceStatus names the host actions that the blue-green
