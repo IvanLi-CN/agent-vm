@@ -47,6 +47,21 @@ func (actions *LifecycleActions) ExecuteVMActionWithVersion(ctx context.Context,
 	if protocolAction == "" {
 		protocolAction = action
 	}
+	response, err := actions.Service.Dispatch(ctx, vmActionRequest(operationID, protocolAction, task, generation, targetVersion, reason, parameters))
+	if err != nil {
+		return nil, err
+	}
+	if result, ok := response["result"].(map[string]any); ok {
+		return result, nil
+	}
+	return response, nil
+}
+
+// vmActionRequest builds the lifecycle request for a management VM action.
+// The audit reason is already durable in the management operation journal and
+// audit trail, and the lifecycle protocol only accepts a reason for the
+// actions that store it themselves, so it is not forwarded for the rest.
+func vmActionRequest(operationID, protocolAction string, task *state.Task, generation int64, targetVersion, reason string, parameters map[string]any) protocol.Request {
 	request := protocol.Request{
 		"protocol":     protocol.Version,
 		"action":       protocolAction,
@@ -57,20 +72,13 @@ func (actions *LifecycleActions) ExecuteVMActionWithVersion(ctx context.Context,
 	if targetVersion != "" {
 		request["management_target_version"] = targetVersion
 	}
-	if reason != "" {
+	if reason != "" && (protocolAction == "pin" || protocolAction == "unpin") {
 		request["reason"] = reason
 	}
 	for key, value := range parameters {
 		request[key] = value
 	}
-	response, err := actions.Service.Dispatch(ctx, request)
-	if err != nil {
-		return nil, err
-	}
-	if result, ok := response["result"].(map[string]any); ok {
-		return result, nil
-	}
-	return response, nil
+	return request
 }
 
 func (actions *LifecycleActions) ExecuteMaintenance(ctx context.Context, operationID, action string, parameters map[string]any) (map[string]any, error) {

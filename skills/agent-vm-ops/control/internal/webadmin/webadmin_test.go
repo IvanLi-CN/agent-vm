@@ -746,3 +746,36 @@ func TestImageListTokenScopeAndSafeSelectionErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestSafeAgentCodeKeepsHoldRefusals(t *testing.T) {
+	for _, code := range []string{"lease_pinned", "already_pinned", "not_pinned"} {
+		if safeAgentCode(code) != code {
+			t.Fatalf("hold refusal hidden from the agent transport: %s", code)
+		}
+		if status := agentErrorStatus(code); status != http.StatusConflict {
+			t.Fatalf("hold refusal status for %s = %d", code, status)
+		}
+	}
+}
+
+func TestVMActionRequestForwardsReasonOnlyForHoldActions(t *testing.T) {
+	task := &state.Task{TaskID: "task-1", SessionID: "session-1", Generation: 3}
+	restart := vmActionRequest("restart-1", "restart", task, 3, "vm:task-1:now", "operator note", map[string]any{"allow_restart": true})
+	if _, present := restart["reason"]; present {
+		t.Fatalf("restart forwarded the audit reason: %#v", restart)
+	}
+	if restart["allow_restart"] != true {
+		t.Fatalf("restart lost its parameters: %#v", restart)
+	}
+	pin := vmActionRequest("pin-1", "pin", task, 3, "vm:task-1:now", "owner review", nil)
+	if pin["reason"] != "owner review" {
+		t.Fatalf("pin lost its reason: %#v", pin)
+	}
+	unpin := vmActionRequest("unpin-1", "unpin", task, 3, "vm:task-1:now", "no longer needed", nil)
+	if unpin["reason"] != "no longer needed" {
+		t.Fatalf("unpin lost its reason: %#v", unpin)
+	}
+	if restart["management_target_version"] != "vm:task-1:now" {
+		t.Fatalf("target version dropped: %#v", restart)
+	}
+}

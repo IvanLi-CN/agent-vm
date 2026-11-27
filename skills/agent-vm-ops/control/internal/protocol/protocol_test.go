@@ -151,6 +151,18 @@ func TestValidateRequestCountsPinReasonInUnicodeCharacters(t *testing.T) {
 	}
 }
 
+func TestValidateRequestAcceptsReasonOnlyWhereAnActionStoresIt(t *testing.T) {
+	if control := ValidateRequest(Request{"protocol": Version, "action": "admin-reconcile-history", "operation_id": "history-valid", "operation_ids": []any{"unknown-1"}, "apply": true, "reason": strings.Repeat("心", 500)}); control != nil {
+		t.Fatalf("500-character reconciliation reason = %#v", control)
+	}
+	if control := ValidateRequest(Request{"protocol": Version, "action": "admin-reconcile-history", "operation_id": "history-too-long", "operation_ids": []any{"unknown-1"}, "apply": true, "reason": strings.Repeat("心", 501)}); control == nil || control.Code != "invalid_request" {
+		t.Fatalf("501-character reconciliation reason = %#v", control)
+	}
+	if control := ValidateRequest(Request{"protocol": Version, "action": "restart", "session_id": "s", "generation": int64(1), "operation_id": "restart-with-reason", "reason": "operator note"}); control == nil || control.Code != "invalid_request" {
+		t.Fatalf("restart carrying a reason = %#v", control)
+	}
+}
+
 func TestValidateRequestAcceptsImageWithLeaseSemantics(t *testing.T) {
 	request := Request{
 		"protocol": Version, "action": "acquire", "session_id": "s", "generation": int64(0), "operation_id": "acquire-image-lease",
