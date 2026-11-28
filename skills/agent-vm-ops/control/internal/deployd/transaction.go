@@ -1441,15 +1441,29 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	}
 	readyContext, stopRenewal := manager.beginTransactionRenewal(ctx, lease)
 	readyErr := manager.waitForReady(readyContext, "", observation.ActiveSlot)
+	var trafficErr error
 	if readyErr == nil {
-		readyErr = manager.Runtime.EnableTraffic(readyContext, observation.ActiveSlot)
+		trafficErr = manager.Runtime.EnableTraffic(readyContext, observation.ActiveSlot)
 	}
 	renewalErr := stopRenewal()
-	if readyErr != nil {
-		return manager.fenceSlots(ctx, fmt.Errorf("active controller readiness or traffic failed: %w", readyErr))
-	}
 	if renewalErr != nil {
 		return manager.fenceSlots(ctx, fmt.Errorf("active controller renewal failed: %w", renewalErr))
+	}
+	if trafficErr != nil {
+		// The traffic role itself failed to change, which is a role-channel
+		// failure rather than a readiness signal.
+		return manager.fenceSlots(ctx, fmt.Errorf("active controller traffic role failed: %w", trafficErr))
+	}
+	if readyErr != nil {
+		// Business readiness gates traffic only; it never governs the
+		// controller role. Fencing a verified same-process lease because a slot
+		// is not admission-ready would tear authority down every maintenance
+		// interval and turn each in-flight mutation into an unknown outcome.
+		// Keep the renewed lease, close traffic, and retry on the next interval.
+		if err := manager.Runtime.DisableTraffic(ctx, observation.ActiveSlot); err != nil {
+			return manager.fenceSlots(ctx, fmt.Errorf("disable traffic for a not-ready active controller: %w", err))
+		}
+		return nil
 	}
 	return nil
 }
