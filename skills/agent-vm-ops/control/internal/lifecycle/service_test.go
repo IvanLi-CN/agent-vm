@@ -4503,6 +4503,61 @@ func TestStartupReconcileLeavesOrphanedAcquireWithNativeInstanceBlocked(t *testi
 	}
 }
 
+// A pending acquire whose native worker finished, whose instance is still the
+// exact durable task generation, and whose guest is running has already taken
+// effect. Leaving it pending closes admission forever because no recovery lane
+// accepts an acquire with a finished worker on an active task.
+func TestStartupReconcileFinalizesEffectivePendingAcquire(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "effective-pending-acquire.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := nowString(time.Now())
+	session, taskGeneration := "effective-acquire-session", int64(2)
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "effective-acquire-task", SessionID: session, Generation: taskGeneration, State: stateActive,
+		InstanceName: "agent-effective-acquire", VMIP: stringPointer("10.20.0.150"),
+		CreatedAt: now, UpdatedAt: now, LeaseExpiresAt: stringPointer(nowString(time.Now().Add(time.Hour))),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": int64(1), "operation_id": "effective-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(1)
+	if err := store.RecordOperation(ctx, "effective-acquire", "acquire", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request),
+		"_task_id": "effective-acquire-task", "_task_generation": taskGeneration,
+		"worker": map[string]any{"state": "finished", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1", "finished_at": now},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &quiescentStartupGuest{startupGuest: &startupGuest{status: "Running", config: map[string]any{
+		"config":           map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "effective-acquire-task", "user.agent-vm.session": session, "user.agent-vm.generation": fmt.Sprint(taskGeneration)},
+		"devices":          map[string]any{},
+		"expanded_devices": map[string]any{},
+	}}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatalf("startup reconcile blocked on an effective acquire: %v", err)
+	}
+	operation, err := store.GetOperation(ctx, "effective-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "success" {
+		t.Fatalf("effective acquire outcome = %#v", operation)
+	}
+	if operation.Response["_request_digest"] != digest {
+		t.Fatalf("effective acquire digest = %#v, want %q", operation.Response["_request_digest"], digest)
+	}
+}
+
 func TestStartupReconcileCancelsAcquireForCachedStoppedTask(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "cached-pending-acquire.sqlite3"))
 	if err != nil {

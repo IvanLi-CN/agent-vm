@@ -1864,6 +1864,13 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 		if err != nil {
 			return s.sqliteError(err)
 		}
+		if err := s.reconcileEffectiveAcquireOperations(ctx, pending); err != nil {
+			return err
+		}
+		pending, err = s.Store.PendingOperations(ctx)
+		if err != nil {
+			return s.sqliteError(err)
+		}
 		if err := s.reconcileOrphanedAcquireOperations(ctx, pending); err != nil {
 			if protocol.AsError(err).Code != "startup_reconcile_required" {
 				return err
@@ -1908,6 +1915,134 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 // proves that no old control child or Incus background operation remains.
 type recoveryQuiescence interface {
 	VerifyRecoveryQuiescence(context.Context) error
+}
+
+// reconcileEffectiveAcquireOperations closes the crash window between a native
+// acquire effect and its terminal journal record. Without it a pending acquire
+// whose worker finished on an active task matches no recovery lane at all:
+// recoverPending rejects acquire, reconcilePendingWorkers needs a running or
+// failed worker, reconcileSupersededOperations needs a cached task and
+// reconcileOrphanedAcquire needs a missing task. Admission then stays closed
+// indefinitely, and the scheduler cannot expire the lease because maintenance
+// only runs once admission is ready.
+//
+// The effect is only accepted when every durable and native witness agrees: the
+// request is bound to this exact task generation, the worker finished with a
+// complete identity and no error, its process group is gone, the native
+// ownership labels match, and the guest is running. Any unmet or unverified
+// condition leaves the operation pending for explicit operator recovery.
+func (s *Service) reconcileEffectiveAcquireOperations(ctx context.Context, pending []state.Operation) error {
+	if s.Guest == nil || native.WorkerOperationID(ctx) != "" {
+		return nil
+	}
+	for _, operation := range pending {
+		if operation.Action != "acquire" || operation.SessionID == nil || operation.Generation == nil {
+			continue
+		}
+		if s.operationActive(operation.OperationID) {
+			continue
+		}
+		unlock, acquired := s.trySessionLock(*operation.SessionID)
+		if !acquired {
+			continue
+		}
+		err := s.reconcileEffectiveAcquire(ctx, operation)
+		unlock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) reconcileEffectiveAcquire(ctx context.Context, operation state.Operation) error {
+	current, err := s.Store.GetOperation(ctx, operation.OperationID)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if current == nil || current.Action != "acquire" || current.SessionID == nil || current.Generation == nil || stringValue(current.Response["outcome"]) != "pending" {
+		return nil
+	}
+	worker, workerOK := current.Response["worker"].(map[string]any)
+	if !workerOK || workerOwnershipUnresolved(worker) {
+		return nil
+	}
+	if stateValue := stringValue(worker["state"]); stateValue != "finished" && stateValue != "exited" {
+		return nil
+	}
+	if workerExitTime(worker) == "" {
+		return nil
+	}
+	pid, pidOK := protocol.Integer(worker["pid"])
+	processGroup, groupOK := protocol.Integer(worker["process_group"])
+	startTime := stringValue(worker["start_time"])
+	if !pidOK || !groupOK || pid <= 0 || processGroup <= 0 || startTime == "" {
+		// No complete identity means the native effect cannot be attributed to
+		// this request; keep it pending for explicit operator recovery.
+		return nil
+	}
+	alive, aliveErr := native.WorkerAlive(native.WorkerIdentity{PID: int(pid), ProcessGroup: int(processGroup), StartTime: startTime})
+	if aliveErr != nil || alive {
+		return nil
+	}
+	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": *current.SessionID})
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if task == nil || task.State != stateActive || !acquireOperationMatchesTask(*current, task) {
+		return nil
+	}
+	if task.LeaseExpiresAt == nil {
+		return nil
+	}
+	digest := stringValue(current.Response["_request_digest"])
+	if digest == "" {
+		return nil
+	}
+	saved, savedOK := current.Response["_request"].(map[string]any)
+	if !savedOK {
+		return nil
+	}
+	request := protocol.Request(saved)
+	computed, digestErr := protocol.Digest(request)
+	if protocol.ValidateRequest(request) != nil || digestErr != nil || computed != digest {
+		return nil
+	}
+	if stringValue(request["action"]) != "acquire" || stringValue(request["operation_id"]) != current.OperationID || stringValue(request["session_id"]) != *current.SessionID || intValue(request["generation"]) != *current.Generation {
+		return nil
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+	defer cancel()
+	if _, ownershipErr := s.verifyOwnership(checkCtx, task); ownershipErr != nil {
+		if protocol.AsError(ownershipErr).Code == "ownership_mismatch" {
+			// A durable active task whose native identity differs is a real
+			// conflict, not an unrecorded success.
+			return ownershipErr
+		}
+		return nil
+	}
+	status, statusErr := s.Guest.Status(checkCtx, task.InstanceName)
+	if statusErr != nil {
+		return nil
+	}
+	stateValue, parseErr := native.ParseStatus(status)
+	if parseErr != nil || !strings.EqualFold(stateValue, "running") {
+		return nil
+	}
+	summary, summaryErr := s.summary(ctx, task)
+	if summaryErr != nil {
+		return summaryErr
+	}
+	response := protocol.SuccessWithRelease(request, summary, s.Release, nil)
+	response["_request_digest"] = digest
+	response["worker"] = worker
+	response["recovered_effective_acquire"] = map[string]any{
+		"basis":        "native-effect-verified",
+		"task_id":      task.TaskID,
+		"generation":   task.Generation,
+		"recovered_at": nowString(s.Clock()),
+	}
+	return s.recordOperation(ctx, current.OperationID, current.Action, current.SessionID, current.Generation, response)
 }
 
 // reconcileSupersededOperations preserves the original request and worker
