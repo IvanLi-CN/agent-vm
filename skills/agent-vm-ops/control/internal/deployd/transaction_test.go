@@ -44,6 +44,8 @@ type fakeRuntime struct {
 	releaseIDs            map[string]string
 	legacyGrant           bool
 	grantedLeases         []controllerrole.Lease
+	fencedSlots           []string
+	revokedSlots          []string
 }
 
 func (runtime *fakeRuntime) RenewTransactionLease(_ context.Context, lease controllerrole.Lease) (controllerrole.Lease, error) {
@@ -136,6 +138,7 @@ func (runtime *fakeRuntime) GrantController(_ context.Context, slot string, leas
 }
 func (runtime *fakeRuntime) RevokeController(_ context.Context, slot string, _ uint64) error {
 	runtime.sequence = append(runtime.sequence, "revoke")
+	runtime.revokedSlots = append(runtime.revokedSlots, slot)
 	if runtime.failRevoke {
 		return errors.New("revoke failed")
 	}
@@ -147,6 +150,7 @@ func (runtime *fakeRuntime) RevokeController(_ context.Context, slot string, _ u
 }
 func (runtime *fakeRuntime) FenceController(_ context.Context, slot string) error {
 	runtime.sequence = append(runtime.sequence, "fence")
+	runtime.fencedSlots = append(runtime.fencedSlots, slot)
 	if observation, ok := runtime.observations[slot]; ok {
 		observation.ControllerOwned = false
 		runtime.observations[slot] = observation
@@ -1830,6 +1834,48 @@ func TestMaintainControllerPreservesTrafficWhenInventoryUnavailable(t *testing.T
 	}
 	if !snapshot.ControllerRecoveryOnly || validObservation(snapshot, now) {
 		t.Fatalf("inventory timeout classification = recovery_only:%t valid:%t", snapshot.ControllerRecoveryOnly, validObservation(snapshot, now))
+	}
+}
+
+// A slot that a verified, same-process controller lease already owns must keep
+// that authority when only business readiness fails. Repeatedly fencing on a
+// not-ready slot tears the controller role down every maintenance interval and
+// turns each in-flight mutation into a lease-loss unknown outcome.
+func TestMaintainControllerKeepsVerifiedLeaseWhenSlotIsNotReady(t *testing.T) {
+	start := controllerrole.ProcessStartToken(os.Getpid())
+	if start == "" {
+		t.Skip("Linux process-incarnation evidence required")
+	}
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	lease := controllerrole.Lease{Slot: "blue", Term: 7, LeaseID: "existing-lease", Nonce: "existing-nonce", Generation: 1, Expiry: now.Add(time.Minute), OwnerPID: os.Getpid(), OwnerStartTime: start}
+	runtime := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: false, ControllerOwned: true, LeaseRenewalSupported: true, ControllerLease: &lease},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true},
+	}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	if err := manager.MaintainController(context.Background()); err != nil {
+		t.Fatalf("not-ready slot revoked a verified controller lease: %v; sequence=%v", err, runtime.sequence)
+	}
+	for _, slot := range runtime.fencedSlots {
+		if slot == "blue" {
+			t.Fatalf("not-ready slot fenced the verified active controller: sequence=%v", runtime.sequence)
+		}
+	}
+	for _, slot := range runtime.revokedSlots {
+		if slot == "blue" {
+			t.Fatalf("not-ready slot revoked the verified active controller role: sequence=%v", runtime.sequence)
+		}
+	}
+	if runtime.traffic["blue"] {
+		t.Fatalf("not-ready slot kept traffic enabled: %v", runtime.traffic)
+	}
+	if !runtime.observations["blue"].ControllerOwned || len(runtime.grantedLeases) != 1 {
+		t.Fatalf("verified controller lease was not renewed: owned=%t leases=%+v", runtime.observations["blue"].ControllerOwned, runtime.grantedLeases)
 	}
 }
 
