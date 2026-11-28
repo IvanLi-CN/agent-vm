@@ -4558,6 +4558,61 @@ func TestStartupReconcileFinalizesEffectivePendingAcquire(t *testing.T) {
 	}
 }
 
+// A crash after the native effect but before the state commit leaves the task
+// `preparing` while the guest already runs the bound generation. Without this
+// lane the pending acquire blocks admission exactly like the `active` variant.
+func TestStartupReconcileFinalizesPreparingAcquireWithRunningGuest(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "preparing-effective-acquire.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := nowString(time.Now())
+	session, taskGeneration := "preparing-acquire-session", int64(3)
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "preparing-acquire-task", SessionID: session, Generation: taskGeneration, State: statePreparing,
+		InstanceName: "agent-preparing-acquire", VMIP: stringPointer("10.20.0.151"),
+		CreatedAt: now, UpdatedAt: now, LeaseExpiresAt: stringPointer(nowString(time.Now().Add(time.Hour))),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": int64(2), "operation_id": "preparing-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(2)
+	if err := store.RecordOperation(ctx, "preparing-acquire", "acquire", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request),
+		"_task_id": "preparing-acquire-task", "_task_generation": taskGeneration,
+		"worker": map[string]any{"state": "finished", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1", "finished_at": now},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &quiescentStartupGuest{startupGuest: &startupGuest{status: "Running", config: map[string]any{
+		"config":           map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "preparing-acquire-task", "user.agent-vm.session": session, "user.agent-vm.generation": fmt.Sprint(taskGeneration)},
+		"devices":          map[string]any{},
+		"expanded_devices": map[string]any{},
+	}}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatalf("startup reconcile blocked on a preparing acquire: %v", err)
+	}
+	operation, err := store.GetOperation(ctx, "preparing-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "success" {
+		t.Fatalf("preparing acquire outcome = %#v", operation)
+	}
+	task, err := store.GetTask(ctx, map[string]any{"session_id": session})
+	if err != nil || task == nil || task.State != stateActive {
+		t.Fatalf("preparing task was not committed active: %#v err=%v", task, err)
+	}
+}
+
 func TestStartupReconcileCancelsAcquireForCachedStoppedTask(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "cached-pending-acquire.sqlite3"))
 	if err != nil {

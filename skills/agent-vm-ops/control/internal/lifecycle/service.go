@@ -1989,10 +1989,18 @@ func (s *Service) reconcileEffectiveAcquire(ctx context.Context, operation state
 	if err != nil {
 		return s.sqliteError(err)
 	}
-	if task == nil || task.State != stateActive || !acquireOperationMatchesTask(*current, task) {
+	// A crash between the native acquire effect and its state commit leaves the
+	// task in `preparing` while the guest already runs the bound generation.
+	// `active` covers a lost terminal journal record; `preparing` covers a lost
+	// state commit. Both must show a live lease for this generation.
+	if task == nil || (task.State != stateActive && task.State != statePreparing) || !acquireOperationMatchesTask(*current, task) {
 		return nil
 	}
 	if task.LeaseExpiresAt == nil {
+		return nil
+	}
+	deadline, deadlineErr := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt)
+	if deadlineErr != nil || !deadline.After(s.Clock()) {
 		return nil
 	}
 	digest := stringValue(current.Response["_request_digest"])
@@ -2028,6 +2036,19 @@ func (s *Service) reconcileEffectiveAcquire(ctx context.Context, operation state
 	stateValue, parseErr := native.ParseStatus(status)
 	if parseErr != nil || !strings.EqualFold(stateValue, "running") {
 		return nil
+	}
+	if task.State == statePreparing {
+		// The guest is verified running at this exact generation, so commit the
+		// preparation that the crash prevented.
+		commitNow := s.Clock()
+		updated, updateErr := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{statePreparing}, LeaseActiveAfter: &commitNow}, map[string]any{"state": stateActive, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": nil, "cleanup_after": nil, "updated_at": nowString(commitNow), "last_error": nil, "resource_reservation_json": "{}", "reservation_bytes": int64(0)})
+		if updateErr != nil {
+			return s.sqliteError(updateErr)
+		}
+		if !updated {
+			return nil
+		}
+		task.State, task.ResourceReservationJSON = stateActive, "{}"
 	}
 	summary, summaryErr := s.summary(ctx, task)
 	if summaryErr != nil {
